@@ -1,0 +1,9 @@
+[package]
+name = "spinr"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP performance & debugging tool"
+license = "MIT"
+
+[dependencies]
+argh = "0.1"
