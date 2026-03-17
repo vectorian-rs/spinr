@@ -288,7 +288,7 @@ All errors should be actionable.
 ### Language & Tooling
 
 - **Language:** Rust (edition 2024)
-- **Build:** Cargo workspace
+- **Build:** Single Cargo crate (no workspace)
 - **CLI parser:** `argh` (already in use — do not migrate to clap)
 - **Async runtime:** Tokio (multi-threaded)
 
@@ -306,42 +306,36 @@ All errors should be actionable.
 | Logging | `tracing` + `tracing-subscriber` | Structured logging |
 | Error handling | `anyhow` + `thiserror` | `anyhow` for binary, `thiserror` for library errors |
 
-### Workspace Layout
+### Project Layout
 
 ```
 spinr/
-├── Cargo.toml              # workspace root
+├── Cargo.toml              # single crate, all dependencies
 ├── Cargo.lock
-├── crates/
-│   ├── spinr/              # main binary crate
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── main.rs     # subcommand dispatch
-│   │       ├── cli.rs      # argh arg structs
-│   │       └── output.rs   # human-readable formatters
-│   ├── spinr-trace/        # trace library crate
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── tracer.rs   # from mcp-httptrace
-│   │       └── types.rs
-│   ├── spinr-loadtest/     # load-test library crate
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── manager.rs  # from mcp-load-tester
-│   │       ├── worker.rs
-│   │       ├── types.rs
-│   │       └── bench.rs
-│   └── spinr-common/       # shared MCP, JSON-RPC, transport
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── jsonrpc.rs
-│           ├── mcp.rs
-│           └── transport.rs
-├── prds/
-└── docs/
+├── src/
+│   ├── main.rs             # entry point, subcommand dispatch
+│   ├── cli.rs              # argh argument definitions
+│   ├── output.rs           # human-readable formatters
+│   ├── trace/
+│   │   ├── mod.rs          # re-exports
+│   │   ├── tracer.rs       # HTTP timing (DNS, TCP, TLS, TTFB, transfer)
+│   │   └── types.rs        # TraceResult, TimingInfo, etc.
+│   ├── loadtest/
+│   │   ├── mod.rs          # re-exports
+│   │   ├── manager.rs      # spawns/coordinates worker processes
+│   │   ├── worker.rs       # rate-limited request loop (blocking)
+│   │   ├── max_throughput.rs  # closed-loop async benchmark
+│   │   └── types.rs        # HdrHistogram, MergedMetrics, configs
+│   └── mcp/
+│       ├── mod.rs           # JSON-RPC 2.0 + MCP protocol types
+│       ├── stdio.rs         # stdio JSON-RPC server
+│       └── transport.rs     # streamable HTTP transport with SSE
+├── docs/
+│   └── prds/
+├── dev.arm64.Dockerfile
+├── dev.x86.Dockerfile
+├── prod.arm64.Dockerfile
+└── prod.x86.Dockerfile
 ```
 
 ### Deployment
@@ -395,65 +389,56 @@ spinr/
 
 ---
 
-## 13. Open Questions
+## 13. Resolved Questions
 
-1. **`common` crate migration scope:** User will copy the original `common` crate into this workspace. Need to assess how much refactoring is needed once it lands — it may reference workspace dependencies from the old repo that need updating.
-2. **`--data` / `-d` short flag conflict:** Both `--duration` and `--data` want `-d`. wrk2 uses `-d` for duration. Current resolution: `-d` maps to `--duration` (wrk2 convention), `--data` has no short form. Alternatively, use `-b` (body) as the short form for request body. Needs decision.
-3. **Coordinated omission correction:** wrk2's primary contribution is correcting for coordinated omission in latency measurement. The current load-tester uses `governor` for rate limiting but it's unclear if the measurement accounts for coordinated omission. Should spinr v1 address this, or defer?
-4. **Connection pooling semantics:** wrk2's `-c` flag means total concurrent connections across all threads. The current implementation uses 1 connection per worker process (via `reqwest` blocking client). Should spinr expose `-c` as connections-per-thread (simpler) or total connections (wrk2 compat)?
+1. **`common` crate migration scope:** Resolved — the common crate was inlined into `src/mcp/` as part of the single-crate restructuring. No external workspace dependencies remain.
+2. **`--data` / `-d` short flag conflict:** Resolved — `trace` uses `-d` for `--data` (no duration concept). `load-test` uses `-d` for `--duration` (wrk2 convention) and `-b` for `--body`.
+3. **Coordinated omission correction:** Deferred to v2. v1 uses `governor` for rate limiting with wall-clock latency measurement. Coordinated omission correction requires tracking intended send time vs actual send time — a meaningful addition but not blocking v1.
+4. **Connection pooling semantics:** Resolved — `-c` controls total connections in `--max-throughput` mode. In rate-limited mode, each worker process uses one blocking `reqwest` connection (1:1 process-to-connection model).
 
 ---
 
-## 14. Diagram
+## 14. Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    spinr binary                      │
-│                                                      │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │  CLI     │  │   trace      │  │  load-test    │  │
-│  │  Parser  │──│  subcommand  │  │  subcommand   │  │
-│  │  (argh)  │  │              │  │               │  │
-│  └──────────┘  └──────┬───────┘  └──────┬────────┘  │
-│                       │                  │           │
-│              ┌────────┴──┐      ┌────────┴────────┐  │
-│              │ --mcp?    │      │ --mcp?          │  │
-│              ├───┬───────┤      ├───┬─────────────┤  │
-│              │ N │  Y    │      │ N │  Y          │  │
-│              └─┬─┘  │    │      └─┬─┘  │          │  │
-│                │    │    │        │    │           │  │
-│         ┌──────┘    │    │  ┌─────┘    │           │  │
-│         ▼           ▼    │  ▼          ▼           │  │
-│   ┌──────────┐ ┌────────┐│ ┌────────┐ ┌─────────┐ │  │
-│   │ Direct   │ │  MCP   ││ │Direct  │ │  MCP    │ │  │
-│   │ CLI run  │ │ Server ││ │CLI run │ │ Server  │ │  │
-│   │ (stdout) │ │(stdio/ ││ │(stdout)│ │(stdio/  │ │  │
-│   │          │ │ http)  ││ │        │ │ http)   │ │  │
-│   └────┬─────┘ └───┬────┘│ └───┬────┘ └───┬─────┘ │  │
-│        │           │     │     │           │       │  │
-└────────┼───────────┼─────┼─────┼───────────┼───────┘  │
-         │           │     │     │           │          │
-         ▼           ▼     │     ▼           ▼          │
-  ┌─────────────────────┐  │  ┌──────────────────────┐  │
-  │   spinr-trace       │  │  │   spinr-loadtest     │  │
-  │   (library crate)   │  │  │   (library crate)    │  │
-  │                     │  │  │                      │  │
-  │  • DNS resolution   │  │  │  • Manager/worker    │  │
-  │  • TCP connect      │  │  │  • Rate limiting     │  │
-  │  • TLS handshake    │  │  │  • HdrHistogram      │  │
-  │  • TTFB measurement │  │  │  • Max-throughput    │  │
-  │  • HTTP/1.x, 2      │  │  │  • Metrics merge     │  │
-  └─────────┬───────────┘  │  └──────────┬───────────┘  │
-            │              │             │              │
-            └──────┬───────┘             │              │
-                   │                     │              │
-                   ▼                     │              │
-          ┌────────────────┐             │              │
-          │ spinr-common   │◄────────────┘              │
-          │                │                            │
-          │ • JSON-RPC 2.0 │                            │
-          │ • MCP protocol │                            │
-          │ • Transport    │                            │
-          │ • Logging      │                            │
-          └────────────────┘                            │
-```
+![spinr architecture](architecture.svg)
+
+---
+
+## 15. Release Notes
+
+### v0.2.0 — Single Crate Restructuring (2026-03-17)
+
+**What changed:**
+
+- Consolidated three independent crates (`common`, `mcp-httptrace`, `mcp-load-tester`) into a single Rust crate with module-based organization
+- Added CLI mode for both `trace` and `load-test` subcommands — no longer MCP-only
+- Unified MCP stdio server handles trace and load-test tools based on invocation context
+- Added `--mcp` flag at top-level (`spinr --mcp`) to expose all tools, or per-subcommand for scoped exposure
+
+**CLI interface:**
+
+- `spinr trace <url>` — HTTP request tracing with phase-by-phase timing (DNS, TCP, TLS, TTFB, transfer)
+- `spinr load-test <url> -R <rps> -d <seconds>` — rate-limited load testing with HdrHistogram percentiles
+- `spinr load-test <url> --max-throughput` — closed-loop maximum throughput benchmark
+- `spinr --mcp` / `spinr trace --mcp` / `spinr load-test --mcp` — MCP server modes
+
+**MCP tools exposed:**
+
+| Tool | Description |
+|------|-------------|
+| `trace_request` | Trace HTTP request with timing breakdown |
+| `start_load_test` | Start a rate-limited or max-throughput load test |
+| `stop_load_test` | Stop a running load test |
+| `get_status` | Get load test status and metrics |
+
+**Docker:**
+
+- Four Dockerfiles for platform/profile combinations: `{dev,prod}.{arm64,x86}.Dockerfile`
+- Runtime base: `gcr.io/distroless/cc-debian13` (~50-90MB images)
+
+**Known limitations (v1):**
+
+- No coordinated omission correction in latency measurement (deferred to v2)
+- Connection pooling in rate-limited mode is 1:1 (one connection per worker process)
+- `--latency` flag parsed but detailed percentile distribution output not yet implemented
+- Multi-URL comparison output for `spinr trace` not yet implemented
