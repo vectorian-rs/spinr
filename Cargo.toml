@@ -1,10 +1,57 @@
 [package]
 name = "spinr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "HTTP performance & debugging tool"
 license = "MIT"
 repository = "https://github.com/l1x/spinr"
 
 [dependencies]
+# CLI
 argh = "0.1"
+
+# Async runtime
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "net", "io-util", "time",
+    "sync", "process", "signal",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+kiters = "0.3"
+
+# HTTP tracing
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+hickory-resolver = "0.25"
+webpki-roots = "1"
+rustls-pki-types = "1"
+url = "2"
+
+# HTTP load testing
+reqwest = { version = "0.12", features = ["blocking"] }
+governor = "0.8"
+hdrhistogram = "7"
+nonzero_ext = "0.3"
+num_cpus = "1"
+base64 = "0.22"
+
+# MCP transport (HTTP)
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+time = "0.3"
