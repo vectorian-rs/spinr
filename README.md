@@ -84,6 +84,10 @@ docker build --provenance=false --target spinr -t spinr:dev-x86 -f dev.x86.Docke
 
 Images use `gcr.io/distroless/cc-debian13` as runtime base (~50-90MB total).
 
+## Architecture
+
+![spinr architecture](docs/prds/architecture.svg)
+
 ## Project Structure
 
 ```
