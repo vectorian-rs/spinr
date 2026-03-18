@@ -19,6 +19,10 @@ pub struct SpinrArgs {
     /// run as worker process (internal use)
     #[argh(option)]
     pub run_worker: Option<String>,
+
+    /// run as engine child process (internal use, reads config from stdin pipe)
+    #[argh(switch)]
+    pub run_engine: bool,
 }
 
 #[derive(FromArgs, Debug)]
@@ -130,9 +134,17 @@ pub struct LoadTestCommand {
     #[argh(switch, short = 'j')]
     pub json: bool,
 
+    /// export HDR Histogram log to file
+    #[argh(option)]
+    pub hdr_log: Option<String>,
+
     /// run as MCP server instead of CLI
     #[argh(switch)]
     pub mcp: bool,
+
+    /// read and verify response bodies (default: status-code-only + drain)
+    #[argh(switch)]
+    pub verify_body: bool,
 
     /// MCP transport: "stdio" or "http" (default: stdio)
     #[argh(option, default = "String::from(\"stdio\")")]

@@ -225,10 +225,10 @@ async fn handle_post<H: McpHttpHandler + Clone>(
     }
 
     let session_id = get_session_id(&headers);
-    if let Some(sid) = &session_id {
-        if !state.session_exists(sid).await {
-            tracing::warn!(session_id = %sid, "Stale session ID");
-        }
+    if let Some(sid) = &session_id
+        && !state.session_exists(sid).await
+    {
+        tracing::warn!(session_id = %sid, "Stale session ID");
     }
 
     let response = handle_json_rpc_request(&state, request).await;

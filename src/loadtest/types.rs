@@ -5,10 +5,142 @@ use hdrhistogram::Histogram;
 use hdrhistogram::serialization::Serializer as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
+
+// ---------------------------------------------------------------------------
+// Engine contract types (shared between orchestration and engine)
+// ---------------------------------------------------------------------------
+
+/// Engine operating mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EngineMode {
+    /// No rate limiting — send as fast as possible
+    MaxThroughput,
+    /// Constant-rate with optional coordinated-omission correction
+    RateLimited {
+        requests_per_second: u64,
+        latency_correction: bool,
+    },
+}
+
+/// Configuration passed to each engine worker process
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    /// Worker identifier (0-based)
+    pub worker_id: u32,
+    /// Resolved target address
+    pub remote_addr: SocketAddr,
+    /// HTTP method (needed by engine for HEAD response handling)
+    pub method: HttpMethod,
+    /// Number of persistent TCP connections this worker manages
+    pub connections: u32,
+    /// Measurement duration in seconds (excludes warmup)
+    pub duration_seconds: u32,
+    /// Warmup duration in seconds (requests sent but not recorded)
+    pub warmup_seconds: u32,
+    /// Operating mode
+    pub mode: EngineMode,
+    /// Per-connection read buffer size in bytes
+    pub read_buffer_size: usize,
+    /// Whether to read and verify response bodies
+    pub verify_body: bool,
+}
+
+/// Raw metrics returned by a single engine worker process.
+///
+/// Uses `[u64; 600]` for status counters to avoid `HashMap` in the hot path.
+/// Conversion to the public `HashMap<u16, u64>` shape happens in the
+/// orchestration layer at shutdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawWorkerMetrics {
+    /// Worker identifier
+    pub worker_id: u32,
+    /// Total requests completed
+    pub request_count: u64,
+    /// Requests that received a 2xx status
+    pub success_count: u64,
+    /// Non-2xx responses + transport/parse/connect failures
+    pub error_count: u64,
+    /// Status code counts indexed by code (0–599).
+    /// Serialized as a sparse map of non-zero entries for compact JSON.
+    #[serde(
+        serialize_with = "serialize_status_counts",
+        deserialize_with = "deserialize_status_counts"
+    )]
+    pub status_counts: [u64; 600],
+    /// Uncorrected latency (measured from actual send to response)
+    pub latency_uncorrected: HdrLatencyHistogram,
+    /// Corrected latency (measured from scheduled send time). Present
+    /// only in rate-limited mode with latency correction enabled.
+    pub latency_corrected: Option<HdrLatencyHistogram>,
+    /// Actual measurement duration in seconds
+    pub duration_secs: f64,
+    /// Total response body bytes received
+    pub total_bytes: u64,
+}
+
+impl RawWorkerMetrics {
+    /// Convert hot-path `[u64; 600]` counters to the public `HashMap<u16, u64>`.
+    pub fn status_codes_as_map(&self) -> HashMap<u16, u64> {
+        let mut map = HashMap::new();
+        for (code, &count) in self.status_counts.iter().enumerate() {
+            if count > 0 {
+                map.insert(code as u16, count);
+            }
+        }
+        map
+    }
+
+    /// Convert to the public `WorkerMetrics` shape used by output and
+    /// `MergedMetrics::from_workers`.
+    pub fn into_worker_metrics(self) -> WorkerMetrics {
+        WorkerMetrics {
+            worker_id: self.worker_id,
+            request_count: self.request_count,
+            success_count: self.success_count,
+            error_count: self.error_count,
+            status_codes: self.status_codes_as_map(),
+            latency: self.latency_uncorrected,
+            duration_secs: self.duration_secs,
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
+/// Serialize `[u64; 600]` as a sparse JSON map of `{ "200": 1234, "404": 5 }`.
+fn serialize_status_counts<S: serde::Serializer>(
+    counts: &[u64; 600],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let non_zero = counts.iter().filter(|&&c| c > 0).count();
+    let mut map = serializer.serialize_map(Some(non_zero))?;
+    for (code, &count) in counts.iter().enumerate() {
+        if count > 0 {
+            map.serialize_entry(&(code as u16), &count)?;
+        }
+    }
+    map.end()
+}
+
+/// Deserialize the sparse JSON map back into `[u64; 600]`.
+fn deserialize_status_counts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[u64; 600], D::Error> {
+    let map: HashMap<u16, u64> = HashMap::deserialize(deserializer)?;
+    let mut counts = [0u64; 600];
+    for (code, count) in map {
+        if (code as usize) < 600 {
+            counts[code as usize] = count;
+        }
+    }
+    Ok(counts)
+}
 
 /// HTTP method for requests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
+#[allow(clippy::upper_case_acronyms)]
 pub enum HttpMethod {
     #[default]
     GET,
@@ -53,6 +185,7 @@ impl std::str::FromStr for HttpMethod {
 
 /// Configuration for max-throughput (closed-loop) benchmark mode
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MaxThroughputConfig {
     pub target_url: String,
     pub method: HttpMethod,
@@ -103,7 +236,7 @@ pub struct TestConfig {
 }
 
 /// Current status of a load test
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TestStatus {
     /// Whether a test is currently running
     pub running: bool,
@@ -135,21 +268,6 @@ pub struct TestStatus {
     /// Merged metrics from all workers (populated after completion)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MergedMetrics>,
-}
-
-impl Default for TestStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            completed: None,
-            pid: None,
-            start_time: None,
-            end_time: None,
-            config: None,
-            metrics_dir: None,
-            metrics: None,
-        }
-    }
 }
 
 /// Arguments for start_load_test tool
@@ -435,6 +553,9 @@ pub struct MergedMetrics {
     /// Transfer rate in bytes per second
     #[serde(default)]
     pub transfer_per_sec: f64,
+    /// Full merged latency histogram for export
+    #[serde(default)]
+    pub latency_histogram: HdrLatencyHistogram,
 }
 
 impl MergedMetrics {
@@ -497,6 +618,7 @@ impl MergedMetrics {
             worker_count: workers.len() as u32,
             total_bytes,
             transfer_per_sec,
+            latency_histogram: merged_latency,
         }
     }
 }
@@ -527,6 +649,7 @@ impl Default for MergedMetrics {
             worker_count: 0,
             total_bytes: 0,
             transfer_per_sec: 0.0,
+            latency_histogram: HdrLatencyHistogram::default(),
         }
     }
 }
@@ -665,8 +788,16 @@ mod tests {
 
         let p50 = hist.percentile_ms(50.0);
         let p99 = hist.percentile_ms(99.0);
-        assert!(p50 >= 1.9 && p50 <= 2.1, "p50 should be ~2ms, got {}", p50);
-        assert!(p99 >= 1.9 && p99 <= 2.1, "p99 should be ~2ms, got {}", p99);
+        assert!(
+            (1.9..=2.1).contains(&p50),
+            "p50 should be ~2ms, got {}",
+            p50
+        );
+        assert!(
+            (1.9..=2.1).contains(&p99),
+            "p99 should be ~2ms, got {}",
+            p99
+        );
     }
 
     #[test]
@@ -701,21 +832,25 @@ mod tests {
 
     #[test]
     fn test_merged_metrics_from_workers() {
-        let mut w1 = WorkerMetrics::default();
-        w1.worker_id = 0;
-        w1.request_count = 100;
-        w1.success_count = 95;
-        w1.error_count = 5;
-        w1.duration_secs = 10.0;
+        let mut w1 = WorkerMetrics {
+            worker_id: 0,
+            request_count: 100,
+            success_count: 95,
+            error_count: 5,
+            duration_secs: 10.0,
+            ..WorkerMetrics::default()
+        };
         w1.latency.record(5_000);
         w1.latency.record(10_000);
 
-        let mut w2 = WorkerMetrics::default();
-        w2.worker_id = 1;
-        w2.request_count = 100;
-        w2.success_count = 100;
-        w2.error_count = 0;
-        w2.duration_secs = 10.0;
+        let mut w2 = WorkerMetrics {
+            worker_id: 1,
+            request_count: 100,
+            success_count: 100,
+            error_count: 0,
+            duration_secs: 10.0,
+            ..WorkerMetrics::default()
+        };
         w2.latency.record(3_000);
         w2.latency.record(7_000);
 
@@ -731,10 +866,12 @@ mod tests {
 
     #[test]
     fn test_merged_metrics_has_tail_percentiles() {
-        let mut w = WorkerMetrics::default();
-        w.request_count = 10000;
-        w.success_count = 10000;
-        w.duration_secs = 10.0;
+        let mut w = WorkerMetrics {
+            request_count: 10000,
+            success_count: 10000,
+            duration_secs: 10.0,
+            ..WorkerMetrics::default()
+        };
         for i in 1..=10000 {
             w.latency.record(i * 10);
         }
@@ -748,24 +885,112 @@ mod tests {
     }
 
     #[test]
+    fn test_merged_metrics_json_roundtrip_preserves_histogram() {
+        let mut w = WorkerMetrics {
+            request_count: 1000,
+            success_count: 1000,
+            duration_secs: 5.0,
+            ..WorkerMetrics::default()
+        };
+        for i in 1..=1000 {
+            w.latency.record(i * 100);
+        }
+
+        let original = MergedMetrics::from_workers(&[w]);
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: MergedMetrics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            original.latency_histogram.to_base64(),
+            restored.latency_histogram.to_base64()
+        );
+        assert_eq!(original.total_requests, restored.total_requests);
+        assert_eq!(original.latency_p99_ms, restored.latency_p99_ms);
+    }
+
+    #[test]
+    fn test_from_workers_empty_slice_gives_default_histogram() {
+        let merged = MergedMetrics::from_workers(&[]);
+        assert_eq!(merged.total_requests, 0);
+        assert_eq!(merged.successful_requests, 0);
+        assert_eq!(merged.failed_requests, 0);
+        assert_eq!(merged.worker_count, 0);
+        assert_eq!(merged.rps, 0.0);
+        assert_eq!(merged.latency_avg_ms, 0.0);
+        assert_eq!(merged.latency_min_ms, 0.0);
+        assert_eq!(merged.latency_max_ms, 0.0);
+        assert_eq!(merged.latency_p50_ms, 0.0);
+        assert_eq!(merged.latency_p99_ms, 0.0);
+        assert_eq!(merged.latency_histogram.count(), 0);
+    }
+
+    #[test]
+    fn test_from_workers_merges_histogram_data() {
+        let mut w1 = WorkerMetrics {
+            worker_id: 0,
+            request_count: 3,
+            success_count: 3,
+            duration_secs: 5.0,
+            ..WorkerMetrics::default()
+        };
+        w1.latency.record(1_000); // 1ms
+        w1.latency.record(2_000); // 2ms
+        w1.latency.record(3_000); // 3ms
+
+        let mut w2 = WorkerMetrics {
+            worker_id: 1,
+            request_count: 2,
+            success_count: 2,
+            duration_secs: 5.0,
+            ..WorkerMetrics::default()
+        };
+        w2.latency.record(4_000); // 4ms
+        w2.latency.record(100_000); // 100ms
+
+        let merged = MergedMetrics::from_workers(&[w1, w2]);
+
+        assert_eq!(merged.latency_histogram.count(), 5);
+        assert!(
+            merged.latency_min_ms >= 0.9 && merged.latency_min_ms <= 1.1,
+            "min should be ~1ms, got {}",
+            merged.latency_min_ms
+        );
+        assert!(
+            merged.latency_max_ms >= 99.0 && merged.latency_max_ms <= 101.0,
+            "max should be ~100ms, got {}",
+            merged.latency_max_ms
+        );
+
+        // base64 roundtrip preserves count
+        let encoded = merged.latency_histogram.to_base64();
+        let decoded = HdrLatencyHistogram::from_base64(&encoded).unwrap();
+        assert_eq!(decoded.count(), 5);
+    }
+
+    #[test]
     fn test_status_codes_merging() {
-        let mut w1 = WorkerMetrics::default();
-        w1.worker_id = 0;
-        w1.request_count = 100;
-        w1.success_count = 90;
-        w1.error_count = 10;
-        w1.duration_secs = 10.0;
+        let mut w1 = WorkerMetrics {
+            worker_id: 0,
+            request_count: 100,
+            success_count: 90,
+            error_count: 10,
+            duration_secs: 10.0,
+            ..WorkerMetrics::default()
+        };
         w1.status_codes.insert(200, 80);
         w1.status_codes.insert(201, 10);
         w1.status_codes.insert(404, 5);
         w1.status_codes.insert(500, 5);
 
-        let mut w2 = WorkerMetrics::default();
-        w2.worker_id = 1;
-        w2.request_count = 100;
-        w2.success_count = 95;
-        w2.error_count = 5;
-        w2.duration_secs = 10.0;
+        let mut w2 = WorkerMetrics {
+            worker_id: 1,
+            request_count: 100,
+            success_count: 95,
+            error_count: 5,
+            duration_secs: 10.0,
+            ..WorkerMetrics::default()
+        };
         w2.status_codes.insert(200, 90);
         w2.status_codes.insert(201, 5);
         w2.status_codes.insert(400, 3);

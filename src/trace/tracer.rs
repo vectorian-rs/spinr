@@ -139,6 +139,7 @@ pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult> {
 }
 
 /// Trace HTTP/1.x request over TLS
+#[allow(clippy::too_many_arguments)]
 async fn trace_http1_tls(
     tcp_stream: TcpStream,
     host: &str,
@@ -197,6 +198,7 @@ async fn trace_http1_tls(
 }
 
 /// Trace HTTP/2 request over TLS with ALPN
+#[allow(clippy::too_many_arguments)]
 async fn trace_http2(
     tcp_stream: TcpStream,
     host: &str,

@@ -1,6 +1,6 @@
 [package]
 name = "spinr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "HTTP performance & debugging tool"
 license = "MIT"
@@ -41,13 +41,13 @@ webpki-roots = "1"
 rustls-pki-types = "1"
 url = "2"
 
-# HTTP load testing
-reqwest = { version = "0.12", features = ["blocking"] }
-governor = "0.8"
+# HTTP load testing (mio + httparse engine)
 hdrhistogram = "7"
-nonzero_ext = "0.3"
 num_cpus = "1"
 base64 = "0.22"
+mio = { version = "1", features = ["os-poll", "net"] }
+httparse = "1"
+socket2 = "0.5"
 
 # MCP transport (HTTP)
 axum = "0.8"

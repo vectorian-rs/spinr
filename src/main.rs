@@ -5,13 +5,19 @@ mod output;
 mod trace;
 
 use cli::{LoadTestCommand, SpinrArgs, SubCommand, TraceCommand};
-use loadtest::types::{HttpMethod, MaxThroughputConfig, MergedMetrics, TestConfig};
+use loadtest::types::{HttpMethod, MergedMetrics};
 use mcp::stdio::ToolMode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: SpinrArgs = argh::from_env();
+
+    // Engine child mode: read config from stdin pipe, run mio event loop, write metrics to stdout
+    if args.run_engine {
+        loadtest::orchestrator::run_engine_child()?;
+        return Ok(());
+    }
 
     // Worker mode: run worker loop directly (no async runtime needed)
     if let Some(config_json) = args.run_worker {
@@ -81,7 +87,7 @@ async fn async_main(args: SpinrArgs) -> Result<(), Box<dyn std::error::Error + S
                 )
                 .await
             } else {
-                run_loadtest_cli(cmd).await
+                run_loadtest_cli(cmd)
             }
         }
         None => {
@@ -176,14 +182,11 @@ async fn run_trace_cli(cmd: TraceCommand) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Run load test in CLI mode
-async fn run_loadtest_cli(
-    cmd: LoadTestCommand,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let method: HttpMethod = cmd
-        .method
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+/// Run load test in CLI mode (unified: both max-throughput and rate-limited)
+fn run_loadtest_cli(cmd: LoadTestCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::net::ToSocketAddrs;
+
+    let method: HttpMethod = cmd.method.parse().map_err(|e: String| anyhow::anyhow!(e))?;
 
     // Parse headers
     let mut headers = HashMap::new();
@@ -195,51 +198,97 @@ async fn run_loadtest_cli(
         }
     }
 
+    // Build pre-baked request bytes
+    let prepared =
+        loadtest::request::build_request_bytes(&cmd.url, method, &headers, cmd.body.as_deref())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Resolve target address
+    let authority = &prepared.remote_addr_authority;
+    let addr_with_port = if authority.contains(':') {
+        authority.clone()
+    } else {
+        format!("{}:80", authority)
+    };
+    let remote_addr: SocketAddr = addr_with_port
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("DNS resolution failed for {}", authority))?;
+
+    let worker_count = cmd.threads.unwrap_or_else(|| num_cpus::get() as u32).max(1);
     let json = cmd.json;
+    let hdr_log = cmd.hdr_log.clone();
 
-    if cmd.max_throughput {
-        return run_max_throughput(cmd, method, headers).await;
-    }
-
-    run_rate_limited(cmd, method, headers, json)
-}
-
-/// Run max-throughput (closed-loop) benchmark
-async fn run_max_throughput(
-    cmd: LoadTestCommand,
-    method: HttpMethod,
-    headers: HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let json = cmd.json;
-    let config = MaxThroughputConfig {
-        target_url: cmd.url.clone(),
-        method,
-        headers,
-        body: cmd.body,
-        connections: cmd.connections,
-        duration_seconds: cmd.duration,
-        warmup_seconds: cmd.warmup,
+    let mode = if cmd.max_throughput {
+        loadtest::types::EngineMode::MaxThroughput
+    } else {
+        loadtest::types::EngineMode::RateLimited {
+            requests_per_second: cmd.rate as u64,
+            latency_correction: true,
+        }
     };
 
+    // Distribute connections across workers
+    let total_connections = if cmd.max_throughput {
+        cmd.connections.max(worker_count)
+    } else {
+        cmd.connections.max(1)
+    };
+
+    let mut configs = Vec::with_capacity(worker_count as usize);
+    for worker_id in 0..worker_count {
+        let base = total_connections / worker_count;
+        let extra = if worker_id < (total_connections % worker_count) {
+            1
+        } else {
+            0
+        };
+        let conns = (base + extra).max(1);
+
+        configs.push(loadtest::types::EngineConfig {
+            worker_id,
+            remote_addr,
+            method,
+            connections: conns,
+            duration_seconds: cmd.duration,
+            warmup_seconds: cmd.warmup,
+            mode: mode.clone(),
+            read_buffer_size: 8192,
+            verify_body: cmd.verify_body,
+        });
+    }
+
+    // Print test info
     macro_rules! out {
         ($($arg:tt)*) => {
             if json { eprintln!($($arg)*); } else { println!($($arg)*); }
         };
     }
-    out!("Starting max-throughput test:");
-    out!("  URL:         {}", config.target_url);
-    out!("  Method:      {}", config.method);
-    out!("  Connections: {}", config.connections);
-    if let Some(t) = cmd.threads {
-        out!("  Threads:     {}", t);
+    if cmd.max_throughput {
+        out!("Starting max-throughput test:");
+    } else {
+        out!("Starting load test:");
+        out!("  Rate:        {} RPS", cmd.rate);
     }
-    if config.warmup_seconds > 0 {
-        out!("  Warmup:      {}s", config.warmup_seconds);
+    out!("  URL:         {}", cmd.url);
+    out!("  Method:      {}", method);
+    out!("  Target:      {}", remote_addr);
+    out!("  Connections: {}", total_connections);
+    out!("  Workers:     {}", worker_count);
+    if cmd.warmup > 0 {
+        out!("  Warmup:      {}s", cmd.warmup);
     }
-    out!("  Duration:    {}s", config.duration_seconds);
+    out!("  Duration:    {}s", cmd.duration);
     out!();
 
-    let worker_metrics = loadtest::max_throughput::run(config).await;
+    // Run the test
+    let raw_results = loadtest::orchestrator::run_workers(configs, &prepared.bytes)?;
+
+    // Convert to public metrics
+    let worker_metrics: Vec<_> = raw_results
+        .into_iter()
+        .map(|r| r.into_worker_metrics())
+        .collect();
     let metrics = MergedMetrics::from_workers(&worker_metrics);
 
     if json {
@@ -248,64 +297,10 @@ async fn run_max_throughput(
         output::print_metrics(&metrics);
     }
 
-    Ok(())
-}
-
-/// Run rate-limited load test
-fn run_rate_limited(
-    cmd: LoadTestCommand,
-    method: HttpMethod,
-    headers: HashMap<String, String>,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let process_count = cmd.threads.unwrap_or_else(|| num_cpus::get() as u32);
-
-    let metrics_dir = std::env::temp_dir().join(format!("spinr-loadtest-{}", std::process::id()));
-    std::fs::create_dir_all(&metrics_dir)?;
-    let metrics_dir_str = metrics_dir.to_string_lossy().to_string();
-
-    let config = TestConfig {
-        target_url: cmd.url.clone(),
-        method,
-        headers,
-        body: cmd.body,
-        total_rate: cmd.rate,
-        process_count,
-        duration_seconds: cmd.duration,
-        warmup_seconds: cmd.warmup,
-        metrics_dir: Some(metrics_dir_str),
-    };
-
-    macro_rules! out {
-        ($($arg:tt)*) => {
-            if json { eprintln!($($arg)*); } else { println!($($arg)*); }
-        };
+    if let Some(ref path) = hdr_log {
+        output::write_hdr_log(std::path::Path::new(path), &metrics)?;
+        eprintln!("HDR Histogram log written to {}", path);
     }
-    out!("Starting load test:");
-    out!("  URL:       {}", config.target_url);
-    out!("  Method:    {}", config.method);
-    out!("  Rate:      {} RPS", config.total_rate);
-    if config.warmup_seconds > 0 {
-        out!("  Warmup:    {}s", config.warmup_seconds);
-    }
-    out!("  Duration:  {}s", config.duration_seconds);
-    out!("  Workers:   {}", config.process_count);
-    out!();
-
-    loadtest::manager::run(config)?;
-
-    let metrics_path = metrics_dir.join("merged_metrics.json");
-    if let Ok(content) = std::fs::read_to_string(&metrics_path)
-        && let Ok(metrics) = serde_json::from_str::<MergedMetrics>(&content)
-    {
-        if json {
-            println!("{}", serde_json::to_string_pretty(&metrics).unwrap());
-        } else {
-            output::print_metrics(&metrics);
-        }
-    }
-
-    let _ = std::fs::remove_dir_all(&metrics_dir);
 
     Ok(())
 }
@@ -413,21 +408,21 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
         &self,
         id: Option<serde_json::Value>,
         params: serde_json::Value,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = mcp::JsonRpcResponse> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = mcp::JsonRpcResponse> + Send + '_>>
+    {
         let tool_name = params
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         Box::pin(async move {
             match tool_name.as_str() {
-                "trace_request"
-                    if matches!(self.mode, ToolMode::TraceOnly | ToolMode::All) =>
-                {
+                "trace_request" if matches!(self.mode, ToolMode::TraceOnly | ToolMode::All) => {
                     let args: trace::TraceRequestArgs = match serde_json::from_value(arguments) {
                         Ok(a) => a,
                         Err(e) => {
@@ -437,7 +432,7 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
                                     "content": [{"type": "text", "text": format!("Error: Invalid arguments: {}", e)}],
                                     "isError": true
                                 }),
-                            )
+                            );
                         }
                     };
                     match trace::tracer::trace_request(&args).await {

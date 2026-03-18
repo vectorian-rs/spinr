@@ -440,10 +440,11 @@ fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
         }
     }
 
-    if status.completed == Some(true) && status.metrics.is_none() {
-        if let Some(ref metrics_dir) = status.metrics_dir {
-            status.metrics = load_merged_metrics(metrics_dir);
-        }
+    if status.completed == Some(true)
+        && status.metrics.is_none()
+        && let Some(ref metrics_dir) = status.metrics_dir
+    {
+        status.metrics = load_merged_metrics(metrics_dir);
     }
 
     Ok(serde_json::to_string_pretty(&*status).unwrap())
@@ -526,7 +527,7 @@ fn format_iso8601(secs: u64) -> String {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn day_of_year_to_month_day(day_of_year: u32, leap: bool) -> (u32, u32) {
