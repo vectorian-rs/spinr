@@ -235,6 +235,8 @@ fn run_loadtest_cli(cmd: LoadTestCommand) -> Result<(), Box<dyn std::error::Erro
         cmd.connections.max(1)
     };
 
+    loadtest::preflight::run_preflight(total_connections, worker_count, json)?;
+
     let mut configs = Vec::with_capacity(worker_count as usize);
     for worker_id in 0..worker_count {
         let base = total_connections / worker_count;

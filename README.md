@@ -70,16 +70,16 @@ Four Dockerfiles for platform/profile combinations:
 
 ```sh
 # Prod ARM64
-docker build --provenance=false --target spinr -t spinr:prod-arm64 -f prod.arm64.Dockerfile .
+docker build --provenance=false -t spinr:prod-arm64 -f prod.arm64.Dockerfile .
 
 # Dev ARM64
-docker build --provenance=false --target spinr -t spinr:dev-arm64 -f dev.arm64.Dockerfile .
+docker build --provenance=false -t spinr:dev-arm64 -f dev.arm64.Dockerfile .
 
 # Prod x86
-docker build --provenance=false --target spinr -t spinr:prod-x86 -f prod.x86.Dockerfile .
+docker build --provenance=false -t spinr:prod-x86 -f prod.x86.Dockerfile .
 
 # Dev x86
-docker build --provenance=false --target spinr -t spinr:dev-x86 -f dev.x86.Dockerfile .
+docker build --provenance=false -t spinr:dev-x86 -f dev.x86.Dockerfile .
 ```
 
 Images use `gcr.io/distroless/cc-debian13` as runtime base (~50-90MB total).

@@ -1,0 +1,19 @@
+[tasks."docker:prod-arm64"]
+description = "Build prod ARM64 Docker image"
+run = "docker build --provenance=false -t spinr:prod-arm64 -f prod.arm64.Dockerfile ."
+
+[tasks."docker:dev-arm64"]
+description = "Build dev ARM64 Docker image"
+run = "docker build --provenance=false -t spinr:dev-arm64 -f dev.arm64.Dockerfile ."
+
+[tasks."docker:prod-x86"]
+description = "Build prod x86 Docker image"
+run = "docker build --provenance=false -t spinr:prod-x86 -f prod.x86.Dockerfile ."
+
+[tasks."docker:dev-x86"]
+description = "Build dev x86 Docker image"
+run = "docker build --provenance=false -t spinr:dev-x86 -f dev.x86.Dockerfile ."
+
+[tasks."docker:all"]
+description = "Build all Docker images"
+depends = ["docker:prod-arm64", "docker:dev-arm64", "docker:prod-x86", "docker:dev-x86"]
