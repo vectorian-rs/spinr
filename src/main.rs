@@ -321,9 +321,6 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
                         mcp::stdio::handle_start_load_test(&self.state, arguments),
                     )
                 }
-                "stop_load_test" if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) => {
-                    mcp::stdio::wrap_result(id, mcp::stdio::handle_stop_load_test(&self.state))
-                }
                 "get_status" if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) => {
                     mcp::stdio::wrap_result(id, mcp::stdio::handle_get_status(&self.state))
                 }

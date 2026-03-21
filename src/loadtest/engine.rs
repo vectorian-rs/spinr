@@ -462,18 +462,18 @@ fn handle_readable(
                                         return Ok(());
                                     }
                                     BodyKind::Chunked => {
-                                        // Check if the terminal chunk marker is already
-                                        // in the buffer (body portion after headers).
                                         let body_start = parsed.header_len;
                                         let buffered =
                                             &connection.read_buf[body_start..connection.read_len];
-                                        if chunked_body_complete(buffered) {
+                                        let mut decoder = ChunkedDecoder::new();
+                                        let consumed = decoder.feed(buffered) as u64;
+                                        if decoder.is_done() {
                                             if measure_request {
                                                 metrics.record_response(
                                                     Some(status_code),
                                                     request_start,
                                                     scheduled_start,
-                                                    body_bytes_in_buffer,
+                                                    consumed,
                                                     false,
                                                 );
                                             }
@@ -487,6 +487,8 @@ fn handle_readable(
                                         connection.state = ConnectionState::DrainingChunked {
                                             status_code,
                                             should_close,
+                                            decoder,
+                                            bytes_received: consumed,
                                         };
                                         connection.read_len = 0;
                                         connection.reregister(poll, Interest::READABLE)?;
@@ -575,6 +577,8 @@ fn handle_readable(
         ConnectionState::DrainingChunked {
             status_code,
             should_close,
+            mut decoder,
+            mut bytes_received,
         } => {
             let Some(stream) = connection.stream.as_mut() else {
                 return Ok(());
@@ -591,16 +595,15 @@ fn handle_readable(
                         );
                     }
                     Ok(read) => {
-                        // We only need to detect the terminal chunk marker.
-                        // Scan the freshly-read bytes (plus a small overlap to
-                        // catch a marker that spans two reads).
-                        if chunked_body_complete(&connection.read_buf[..read]) {
+                        let consumed = decoder.feed(&connection.read_buf[..read]);
+                        bytes_received += consumed as u64;
+                        if decoder.is_done() {
                             if connection.measure_request {
                                 metrics.record_response(
                                     Some(status_code),
                                     connection.request_start.unwrap_or_else(Instant::now),
                                     connection.scheduled_start,
-                                    0,
+                                    bytes_received,
                                     false,
                                 );
                             }
@@ -609,6 +612,12 @@ fn handle_readable(
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        connection.state = ConnectionState::DrainingChunked {
+                            status_code,
+                            should_close,
+                            decoder,
+                            bytes_received,
+                        };
                         return Ok(());
                     }
                     Err(_) => {
@@ -697,9 +706,109 @@ fn parse_response_head(buf: &[u8], expects_body: bool) -> io::Result<Option<Pars
     }
 }
 
-/// Check if a buffer contains the chunked transfer-encoding terminal marker `0\r\n\r\n`.
-fn chunked_body_complete(buf: &[u8]) -> bool {
-    buf.windows(5).any(|w| w == b"0\r\n\r\n")
+/// Incremental chunked transfer-encoding decoder.
+///
+/// Tracks state across partial reads so that chunk boundaries are parsed
+/// correctly even when data arrives in arbitrary-sized pieces.
+#[derive(Debug, Clone, Copy)]
+enum ChunkedDecoder {
+    /// Accumulating hex chunk-size line. `size` is the parsed value so far,
+    /// `in_ext` is true after seeing `;' (chunk extension — ignored).
+    SizeLine { size: u64, in_ext: bool },
+    /// Skipping `remaining` bytes of chunk data.
+    Data { remaining: u64 },
+    /// Consuming the CRLF after chunk data (`need` counts bytes left: 2→1→0).
+    PostDataCrlf { need: u8 },
+    /// After the last-chunk (size 0): scanning for the empty line that ends
+    /// the trailer section. `matched` counts consecutive bytes of `\r\n`.
+    Trailers { matched: u8 },
+    /// Terminal state — the complete chunked body has been consumed.
+    Done,
+}
+
+impl ChunkedDecoder {
+    fn new() -> Self {
+        ChunkedDecoder::SizeLine {
+            size: 0,
+            in_ext: false,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self, ChunkedDecoder::Done)
+    }
+
+    /// Feed bytes into the decoder. Returns the number of bytes consumed
+    /// (always `<= buf.len()`). After this call, check `is_done()`.
+    fn feed(&mut self, buf: &[u8]) -> usize {
+        let mut pos = 0;
+        while pos < buf.len() && !self.is_done() {
+            match self {
+                ChunkedDecoder::SizeLine { size, in_ext } => {
+                    let b = buf[pos];
+                    pos += 1;
+                    if b == b'\n' {
+                        // End of size line
+                        if *size == 0 {
+                            // Last chunk → scan trailers
+                            *self = ChunkedDecoder::Trailers { matched: 0 };
+                        } else {
+                            *self = ChunkedDecoder::Data { remaining: *size };
+                        }
+                    } else if b == b'\r' {
+                        // Part of CRLF, ignore
+                    } else if b == b';' {
+                        *in_ext = true;
+                    } else if !*in_ext
+                        && let Some(digit) = hex_digit(b)
+                    {
+                        *size = size.wrapping_mul(16).wrapping_add(digit as u64);
+                        // Non-hex chars before ';' are malformed; be lenient.
+                    }
+                }
+                ChunkedDecoder::Data { remaining } => {
+                    let avail = (buf.len() - pos) as u64;
+                    let skip = avail.min(*remaining);
+                    pos += skip as usize;
+                    *remaining -= skip;
+                    if *remaining == 0 {
+                        *self = ChunkedDecoder::PostDataCrlf { need: 2 };
+                    }
+                }
+                ChunkedDecoder::PostDataCrlf { need } => {
+                    pos += 1;
+                    *need -= 1;
+                    if *need == 0 {
+                        *self = ChunkedDecoder::SizeLine {
+                            size: 0,
+                            in_ext: false,
+                        };
+                    }
+                }
+                ChunkedDecoder::Trailers { matched } => {
+                    let b = buf[pos];
+                    pos += 1;
+                    match (*matched, b) {
+                        (0, b'\r') => *matched = 1,
+                        (1, b'\n') => *self = ChunkedDecoder::Done,
+                        (_, b'\r') => *matched = 1,
+                        _ => *matched = 0,
+                    }
+                }
+                ChunkedDecoder::Done => break,
+            }
+        }
+        pos
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn invalid_response(err: impl std::fmt::Display) -> io::Error {
@@ -738,6 +847,8 @@ enum ConnectionState {
     DrainingChunked {
         status_code: u16,
         should_close: bool,
+        decoder: ChunkedDecoder,
+        bytes_received: u64,
     },
     Closed,
 }
@@ -1023,10 +1134,76 @@ mod tests {
     }
 
     #[test]
-    fn chunked_body_complete_detects_terminal_marker() {
-        assert!(chunked_body_complete(b"4\r\ndata\r\n0\r\n\r\n"));
-        assert!(!chunked_body_complete(b"4\r\ndata\r\n"));
-        assert!(chunked_body_complete(b"0\r\n\r\n"));
+    fn chunked_decoder_simple_body() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"4\r\ndata\r\n0\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_no_false_match_in_payload() {
+        // Payload contains the bytes "0\r\n\r\n" but as data, not a terminal chunk
+        let mut dec = ChunkedDecoder::new();
+        let input = b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_with_trailers() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"2\r\nok\r\n0\r\nTrailer: val\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_split_across_feeds() {
+        let mut dec = ChunkedDecoder::new();
+        let full = b"4\r\ndata\r\n0\r\n\r\n";
+        // Feed one byte at a time
+        let mut total = 0;
+        for &b in full.iter() {
+            total += dec.feed(&[b]);
+            if dec.is_done() {
+                break;
+            }
+        }
+        assert!(dec.is_done());
+        assert_eq!(total, full.len());
+    }
+
+    #[test]
+    fn chunked_decoder_multiple_chunks() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_chunk_extension() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"4;ext=val\r\ndata\r\n0\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_hex_uppercase() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"A\r\n0123456789\r\n0\r\n\r\n";
+        dec.feed(input);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn chunked_decoder_incomplete() {
+        let mut dec = ChunkedDecoder::new();
+        let input = b"4\r\nda";
+        dec.feed(input);
+        assert!(!dec.is_done());
     }
 
     #[test]

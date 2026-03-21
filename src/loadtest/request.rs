@@ -116,11 +116,13 @@ fn parse_content_length(headers: &HashMap<String, String>) -> Option<usize> {
 }
 
 fn authority_string(url: &Url) -> String {
+    // url::Url::host_str() already includes brackets for IPv6 (e.g. "[::1]").
+    let host = url.host_str().unwrap();
     match url.port() {
         Some(port) if port != default_port(url.scheme()) => {
-            format!("{}:{}", url.host_str().unwrap(), port)
+            format!("{}:{}", host, port)
         }
-        _ => url.host_str().unwrap().to_string(),
+        _ => host.to_string(),
     }
 }
 
@@ -229,5 +231,31 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BuildRequestError::UnsupportedScheme);
+    }
+
+    #[test]
+    fn ipv6_with_non_default_port() {
+        let prepared = build_request_bytes(
+            "http://[::1]:8080/path",
+            HttpMethod::GET,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        let request = String::from_utf8(prepared.bytes.into_vec()).unwrap();
+        assert!(request.contains("\r\nHost: [::1]:8080\r\n"));
+        assert_eq!(prepared.remote_addr_authority, "[::1]:8080");
+    }
+
+    #[test]
+    fn ipv6_with_default_port() {
+        let prepared =
+            build_request_bytes("http://[::1]/path", HttpMethod::GET, &HashMap::new(), None)
+                .unwrap();
+
+        let request = String::from_utf8(prepared.bytes.into_vec()).unwrap();
+        assert!(request.contains("\r\nHost: [::1]\r\n"));
+        assert_eq!(prepared.remote_addr_authority, "[::1]");
     }
 }

@@ -166,9 +166,6 @@ async fn handle_tools_call(
         "start_load_test" if matches!(mode, ToolMode::LoadTestOnly | ToolMode::All) => {
             wrap_result(id, handle_start_load_test(state, arguments))
         }
-        "stop_load_test" if matches!(mode, ToolMode::LoadTestOnly | ToolMode::All) => {
-            wrap_result(id, handle_stop_load_test(state))
-        }
         "get_status" if matches!(mode, ToolMode::LoadTestOnly | ToolMode::All) => {
             wrap_result(id, handle_get_status(state))
         }
@@ -283,9 +280,9 @@ pub(crate) fn loadtest_tool_definitions() -> Vec<McpTool> {
                         "type": "integer",
                         "description": "Total requests per second across all workers"
                     },
-                    "process_count": {
+                    "threads": {
                         "type": "integer",
-                        "description": "Number of worker processes (default: CPU count)"
+                        "description": "Number of worker threads (default: CPU count)"
                     },
                     "duration_seconds": {
                         "type": "integer",
@@ -293,14 +290,6 @@ pub(crate) fn loadtest_tool_definitions() -> Vec<McpTool> {
                     }
                 },
                 "required": ["target_url", "total_rate", "duration_seconds"]
-            }),
-        ),
-        McpTool::new(
-            "stop_load_test",
-            "Stop the currently running load test. Note: tests run to completion and cannot be cancelled mid-flight.",
-            json!({
-                "type": "object",
-                "properties": {}
             }),
         ),
         McpTool::new(
@@ -318,16 +307,16 @@ pub(crate) fn handle_start_load_test(
     state: &Arc<ServerState>,
     args: Value,
 ) -> Result<String, String> {
-    // Check if a test is already running
+    // Hold join_handle lock through check → parse → spawn → store to prevent
+    // concurrent calls from both passing the running-test guard.
+    let mut handle_guard = state.join_handle.lock().map_err(|e| e.to_string())?;
+
+    if let Some(ref h) = *handle_guard
+        && !h.is_finished()
     {
-        let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
-        if let Some(ref h) = *handle
-            && !h.is_finished()
-        {
-            return Err(
-                "A load test is already running. Stop it first with stop_load_test.".to_string(),
-            );
-        }
+        return Err(
+            "A load test is already running. Wait for it to finish or check status with get_status.".to_string(),
+        );
     }
 
     let args: StartLoadTestArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -335,7 +324,7 @@ pub(crate) fn handle_start_load_test(
     let method_str = args.method.clone().unwrap_or_else(|| "GET".to_string());
     let total_rate = args.total_rate;
     let duration_seconds = args.duration_seconds;
-    let process_count = args.process_count;
+    let threads = args.threads;
 
     let params = args.into_load_test_params()?;
 
@@ -344,7 +333,7 @@ pub(crate) fn handle_start_load_test(
         .map(|d| format_iso8601(d.as_secs()))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Update status to running
+    // Update status to running (lock ordering: join_handle → status)
     {
         let mut status = state.status.lock().map_err(|e| e.to_string())?;
         *status = TestStatus {
@@ -379,11 +368,8 @@ pub(crate) fn handle_start_load_test(
         result
     });
 
-    // Store the join handle
-    {
-        let mut handle_guard = state.join_handle.lock().map_err(|e| e.to_string())?;
-        *handle_guard = Some(handle);
-    }
+    // Store the join handle (lock already held)
+    *handle_guard = Some(handle);
 
     let response = json!({
         "started": true,
@@ -392,28 +378,12 @@ pub(crate) fn handle_start_load_test(
             "target_url": target_url,
             "method": method_str,
             "total_rate": total_rate,
-            "process_count": process_count,
+            "threads": threads,
             "duration_seconds": duration_seconds
         }
     });
 
     Ok(serde_json::to_string_pretty(&response).unwrap())
-}
-
-pub(crate) fn handle_stop_load_test(state: &Arc<ServerState>) -> Result<String, String> {
-    let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
-
-    match *handle {
-        Some(ref h) if !h.is_finished() => Err(
-            "Load tests run to completion and cannot be cancelled mid-flight. \
-             Wait for the test to finish or check status with get_status."
-                .to_string(),
-        ),
-        Some(_) => {
-            Err("No load test is currently running (last test already completed)".to_string())
-        }
-        None => Err("No load test is currently running".to_string()),
-    }
 }
 
 pub(crate) fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
@@ -529,12 +499,11 @@ mod tests {
         let response = handle_tools_list(ToolMode::All, Some(json!(2)));
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4); // trace_request + 3 loadtest tools
+        assert_eq!(tools.len(), 3); // trace_request + 2 loadtest tools
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"trace_request"));
         assert!(names.contains(&"start_load_test"));
-        assert!(names.contains(&"stop_load_test"));
         assert!(names.contains(&"get_status"));
     }
 
@@ -552,7 +521,7 @@ mod tests {
         let response = handle_tools_list(ToolMode::LoadTestOnly, Some(json!(4)));
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]

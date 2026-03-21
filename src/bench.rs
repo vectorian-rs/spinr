@@ -238,10 +238,17 @@ pub fn run_single_loadtest(
     )?;
 
     let authority = &prepared.remote_addr_authority;
-    let addr_with_port = if authority.contains(':') {
-        authority.clone()
+    let addr_with_port = if authority.starts_with('[') {
+        // IPv6 bracketed: "[::1]:8080" or "[::1]"
+        if authority.contains("]:") {
+            authority.clone() // already has port
+        } else {
+            format!("{}:80", authority) // e.g. "[::1]:80"
+        }
+    } else if authority.contains(':') {
+        authority.clone() // IPv4 with port
     } else {
-        format!("{}:80", authority)
+        format!("{}:80", authority) // IPv4 without port
     };
     let remote_addr: SocketAddr =
         addr_with_port

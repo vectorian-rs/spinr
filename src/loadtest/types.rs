@@ -225,9 +225,9 @@ pub struct StartLoadTestArgs {
     /// Total requests per second
     pub total_rate: u32,
 
-    /// Number of worker processes (default: CPU count)
+    /// Number of worker threads (default: CPU count)
     #[serde(default)]
-    pub process_count: Option<u32>,
+    pub threads: Option<u32>,
 
     /// Test duration in seconds
     pub duration_seconds: u32,
@@ -259,7 +259,7 @@ impl StartLoadTestArgs {
             warmup: 0,
             max_throughput: false,
             rate: self.total_rate,
-            threads: self.process_count,
+            threads: self.threads,
             hdr_log: None,
         })
     }
@@ -589,7 +589,7 @@ mod tests {
             )])),
             body: Some(r#"{"test": true}"#.to_string()),
             total_rate: 1000,
-            process_count: Some(4),
+            threads: Some(4),
             duration_seconds: 30,
         };
 
@@ -612,7 +612,7 @@ mod tests {
             headers: None,
             body: None,
             total_rate: 100,
-            process_count: None,
+            threads: None,
             duration_seconds: 10,
         };
 
@@ -630,7 +630,7 @@ mod tests {
             headers: None,
             body: None,
             total_rate: 0,
-            process_count: None,
+            threads: None,
             duration_seconds: 10,
         };
 
