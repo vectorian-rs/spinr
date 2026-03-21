@@ -5,7 +5,6 @@
 use crate::trace::types::{
     ConnectionInfo, HttpVersion, ResponseInfo, TimingInfo, TraceRequestArgs, TraceResult,
 };
-use anyhow::{Context, Result};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use http_body_util::{BodyExt, Empty};
@@ -20,16 +19,58 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+#[derive(Debug, thiserror::Error)]
+pub enum TraceError {
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+    #[error("URL missing host")]
+    MissingHost,
+    #[error("DNS lookup failed: {0}")]
+    DnsLookup(hickory_resolver::ResolveError),
+    #[error("No IP addresses found")]
+    NoIpAddresses,
+    #[error("TCP connection timeout: {0}")]
+    TcpTimeout(tokio::time::error::Elapsed),
+    #[error("TCP connection failed: {0}")]
+    TcpConnect(std::io::Error),
+    #[error("TLS handshake failed: {0}")]
+    TlsHandshake(std::io::Error),
+    #[error("Invalid server name")]
+    InvalidServerName,
+    #[error("HTTP/2 requires HTTPS")]
+    Http2RequiresHttps,
+    #[error("Server does not support HTTP/2 (ALPN: {alpn})")]
+    Http2NotSupported { alpn: String },
+    #[error("Failed to build request: {0}")]
+    BuildRequest(hyper::http::Error),
+    #[error("HTTP/2 handshake failed: {0}")]
+    Http2Handshake(hyper::Error),
+    #[error("Failed to send HTTP/2 request: {0}")]
+    Http2Send(hyper::Error),
+    #[error("Failed to read response body: {0}")]
+    ReadBody(hyper::Error),
+    #[error("Failed to send request: {0}")]
+    SendRequest(std::io::Error),
+    #[error("Failed to flush request: {0}")]
+    FlushRequest(std::io::Error),
+    #[error("Failed to read status line: {0}")]
+    ReadStatusLine(std::io::Error),
+    #[error("Failed to read headers: {0}")]
+    ReadHeaders(std::io::Error),
+    #[error("Failed to build DNS resolver: {0}")]
+    ResolverBuild(hickory_resolver::ResolveError),
+}
+
 /// Trace an HTTP request with detailed timing
-pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult> {
+pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult, TraceError> {
     let start = Instant::now();
     let mut timing = TimingInfo::default();
 
     // Parse URL
-    let url = url::Url::parse(&args.url).context("Invalid URL")?;
+    let url = url::Url::parse(&args.url)?;
     let scheme = url.scheme();
     let is_https = scheme == "https";
-    let host = url.host_str().context("URL missing host")?.to_string();
+    let host = url.host_str().ok_or(TraceError::MissingHost)?.to_string();
     let port = url.port().unwrap_or(if is_https { 443 } else { 80 });
     let path = if url.path().is_empty() {
         "/".to_string()
@@ -44,12 +85,14 @@ pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult> {
 
     // Phase 1: DNS Resolution
     let dns_start = Instant::now();
-    let resolver = TokioResolver::builder(TokioConnectionProvider::default())?.build();
+    let resolver = TokioResolver::builder(TokioConnectionProvider::default())
+        .map_err(TraceError::ResolverBuild)?
+        .build();
     let response = resolver
         .lookup_ip(&host)
         .await
-        .context("DNS lookup failed")?;
-    let ip = response.iter().next().context("No IP addresses found")?;
+        .map_err(TraceError::DnsLookup)?;
+    let ip = response.iter().next().ok_or(TraceError::NoIpAddresses)?;
     timing.dns_lookup_ms = dns_start.elapsed().as_millis() as u64;
 
     let addr = SocketAddr::new(ip, port);
@@ -62,8 +105,8 @@ pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult> {
         TcpStream::connect(addr),
     )
     .await
-    .context("TCP connection timeout")?
-    .context("TCP connection failed")?;
+    .map_err(TraceError::TcpTimeout)?
+    .map_err(TraceError::TcpConnect)?;
     timing.tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
 
     // Branch based on HTTP version
@@ -71,7 +114,7 @@ pub async fn trace_request(args: &TraceRequestArgs) -> Result<TraceResult> {
         if args.http_version == HttpVersion::Http2 {
             // HTTP/2 requires HTTPS with ALPN
             if !is_https {
-                anyhow::bail!("HTTP/2 requires HTTPS");
+                return Err(TraceError::Http2RequiresHttps);
             }
             trace_http2(
                 tcp_stream,
@@ -150,7 +193,7 @@ async fn trace_http1_tls(
     http_version: HttpVersion,
     remote_ip: &str,
     timing: &mut TimingInfo,
-) -> Result<(ResponseInfo, ConnectionInfo, usize, u64, u64)> {
+) -> Result<(ResponseInfo, ConnectionInfo, usize, u64, u64), TraceError> {
     let tls_start = Instant::now();
 
     // Setup TLS without ALPN (HTTP/1.x)
@@ -162,13 +205,13 @@ async fn trace_http1_tls(
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|_| TraceError::InvalidServerName)?;
 
     let tls_stream = connector
         .connect(server_name, tcp_stream)
         .await
-        .context("TLS handshake failed")?;
+        .map_err(TraceError::TlsHandshake)?;
 
     timing.tls_handshake_ms = tls_start.elapsed().as_millis() as u64;
 
@@ -208,7 +251,7 @@ async fn trace_http2(
     body: Option<&str>,
     remote_ip: &str,
     timing: &mut TimingInfo,
-) -> Result<(ResponseInfo, ConnectionInfo, usize, u64, u64)> {
+) -> Result<(ResponseInfo, ConnectionInfo, usize, u64, u64), TraceError> {
     let tls_start = Instant::now();
 
     // Setup TLS with ALPN for HTTP/2
@@ -223,13 +266,13 @@ async fn trace_http2(
     config.alpn_protocols = vec![b"h2".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|_| TraceError::InvalidServerName)?;
 
     let tls_stream = connector
         .connect(server_name, tcp_stream)
         .await
-        .context("TLS handshake failed")?;
+        .map_err(TraceError::TlsHandshake)?;
 
     timing.tls_handshake_ms = tls_start.elapsed().as_millis() as u64;
 
@@ -237,10 +280,11 @@ async fn trace_http2(
     let (_, conn) = tls_stream.get_ref();
     let alpn = conn.alpn_protocol();
     if alpn != Some(b"h2".as_slice()) {
-        anyhow::bail!(
-            "Server does not support HTTP/2 (ALPN: {:?})",
-            alpn.map(|p| String::from_utf8_lossy(p).to_string())
-        );
+        return Err(TraceError::Http2NotSupported {
+            alpn: alpn
+                .map(|p| String::from_utf8_lossy(p).to_string())
+                .unwrap_or_else(|| "None".to_string()),
+        });
     }
 
     let tls_version = match conn.protocol_version() {
@@ -269,7 +313,7 @@ async fn trace_http2(
 
     // Note: HTTP/2 body support would require a different body type (e.g., Full<Bytes>)
     let _ = body;
-    let request = request.body(req_body).context("Failed to build request")?;
+    let request = request.body(req_body).map_err(TraceError::BuildRequest)?;
 
     let request_size = uri.len()
         + headers
@@ -284,7 +328,7 @@ async fn trace_http2(
     let (mut sender, conn) =
         hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
             .await
-            .context("HTTP/2 handshake failed")?;
+            .map_err(TraceError::Http2Handshake)?;
 
     // Spawn connection driver
     tokio::spawn(async move {
@@ -297,7 +341,7 @@ async fn trace_http2(
     let response = sender
         .send_request(request)
         .await
-        .context("Failed to send HTTP/2 request")?;
+        .map_err(TraceError::Http2Send)?;
     let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
 
     // Read response
@@ -318,7 +362,7 @@ async fn trace_http2(
         .into_body()
         .collect()
         .await
-        .context("Failed to read response body")?
+        .map_err(TraceError::ReadBody)?
         .to_bytes();
     let transfer_ms = transfer_start.elapsed().as_millis() as u64;
 
@@ -360,7 +404,7 @@ async fn send_request_and_read<S>(
     headers: &HashMap<String, String>,
     body: Option<&str>,
     http_version: HttpVersion,
-) -> Result<(ResponseInfo, usize, u64, u64)>
+) -> Result<(ResponseInfo, usize, u64, u64), TraceError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -401,15 +445,15 @@ where
     writer
         .write_all(request.as_bytes())
         .await
-        .context("Failed to send request")?;
-    writer.flush().await.context("Failed to flush request")?;
+        .map_err(TraceError::SendRequest)?;
+    writer.flush().await.map_err(TraceError::FlushRequest)?;
 
     // Read status line (first byte of response)
     let mut status_line = String::new();
     reader
         .read_line(&mut status_line)
         .await
-        .context("Failed to read status line")?;
+        .map_err(TraceError::ReadStatusLine)?;
     let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
 
     // Track headers size (including status line)
@@ -429,7 +473,10 @@ where
 
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(TraceError::ReadHeaders)?;
         headers_size += line.len();
         let trimmed = line.trim();
         if trimmed.is_empty() {

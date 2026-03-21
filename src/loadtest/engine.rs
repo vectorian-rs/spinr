@@ -3,12 +3,21 @@
 use crate::loadtest::types::{
     EngineConfig, EngineMode, HdrLatencyHistogram, HttpMethod, RawWorkerMetrics,
 };
-use anyhow::Context as _;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error("failed to create mio::Poll: {0}")]
+    PollCreate(io::Error),
+    #[error("failed to register TCP stream: {0}")]
+    Register(io::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+}
 
 const STATUS_CODE_SLOTS: usize = 600;
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -73,7 +82,7 @@ impl RawWorkerMetrics {
     }
 }
 
-pub fn run(config: EngineConfig, request_bytes: &[u8]) -> anyhow::Result<RawWorkerMetrics> {
+pub fn run(config: EngineConfig, request_bytes: &[u8]) -> Result<RawWorkerMetrics, EngineError> {
     run_for_durations(
         &config,
         request_bytes,
@@ -87,7 +96,7 @@ fn run_for_durations(
     request_bytes: &[u8],
     warmup_duration: Duration,
     measurement_duration: Duration,
-) -> anyhow::Result<RawWorkerMetrics> {
+) -> Result<RawWorkerMetrics, EngineError> {
     if config.connections == 0 {
         return Ok(RawWorkerMetrics::new(
             config.worker_id,
@@ -101,7 +110,7 @@ fn run_for_durations(
         ));
     }
 
-    let mut poll = Poll::new().context("failed to create mio::Poll")?;
+    let mut poll = Poll::new().map_err(EngineError::PollCreate)?;
     let mut events = Events::with_capacity(DEFAULT_EVENT_CAPACITY.max(config.connections as usize));
 
     let start = Instant::now();
@@ -272,7 +281,7 @@ fn handle_connection_failure(
     connection: &mut Connection,
     metrics: &mut RawWorkerMetrics,
     allow_reconnect: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), EngineError> {
     if let Some((request_start, scheduled_start, measure_request)) = connection.fail_request()
         && measure_request
     {
@@ -295,16 +304,15 @@ fn handle_writable(
     mode: &EngineMode,
     window: RunWindow,
     allow_reconnect: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), EngineError> {
     let now = Instant::now();
 
     match connection.state {
         ConnectionState::Connecting => {
             if let Some(stream) = connection.stream.as_mut()
-                && let Some(err) = stream.take_error()?
+                && let Some(_err) = stream.take_error()?
             {
-                return handle_connection_failure(poll, connection, metrics, allow_reconnect)
-                    .with_context(|| format!("connect error: {err}"));
+                return handle_connection_failure(poll, connection, metrics, allow_reconnect);
             }
 
             connection.state = ConnectionState::Idle;
@@ -358,7 +366,7 @@ fn handle_readable(
     metrics: &mut RawWorkerMetrics,
     expects_response_body: bool,
     allow_reconnect: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), EngineError> {
     match connection.state {
         ConnectionState::Idle => {
             let mut byte = [0u8; 1];
@@ -660,12 +668,12 @@ impl Connection {
         read_buffer_size: usize,
         rate_rps: u64,
         phase_start: Instant,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, EngineError> {
         let mut stream = TcpStream::connect(remote_addr)?;
         stream.set_nodelay(true)?;
         poll.registry()
             .register(&mut stream, token, Interest::WRITABLE)
-            .context("failed to register TCP stream")?;
+            .map_err(EngineError::Register)?;
 
         Ok(Self {
             token,
@@ -696,7 +704,7 @@ impl Connection {
         self.measure_request = false;
     }
 
-    fn reconnect(&mut self, poll: &mut Poll) -> anyhow::Result<()> {
+    fn reconnect(&mut self, poll: &mut Poll) -> Result<(), EngineError> {
         self.close(poll);
         let mut stream = TcpStream::connect(self.remote_addr)?;
         stream.set_nodelay(true)?;
@@ -707,7 +715,7 @@ impl Connection {
         Ok(())
     }
 
-    fn reregister(&mut self, poll: &Poll, interest: Interest) -> anyhow::Result<()> {
+    fn reregister(&mut self, poll: &Poll, interest: Interest) -> Result<(), EngineError> {
         if let Some(stream) = self.stream.as_mut() {
             poll.registry().reregister(stream, self.token, interest)?;
         }
@@ -764,7 +772,7 @@ impl Connection {
         request_bytes: &[u8],
         now: Instant,
         window: RunWindow,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), EngineError> {
         if !window.can_start_requests || !matches!(self.state, ConnectionState::Idle) {
             return Ok(());
         }
@@ -798,7 +806,7 @@ impl Connection {
         poll: &mut Poll,
         should_close: bool,
         allow_reconnect: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), EngineError> {
         if self.rate_rps > 0 {
             self.completed_in_phase += 1;
         }

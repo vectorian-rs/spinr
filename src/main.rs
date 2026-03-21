@@ -1,3 +1,4 @@
+pub(crate) mod bench;
 mod cli;
 mod loadtest;
 mod mcp;
@@ -5,32 +6,23 @@ mod output;
 mod trace;
 
 use cli::{LoadTestCommand, SpinrArgs, SubCommand, TraceCommand};
-use loadtest::types::{HttpMethod, MergedMetrics};
 use mcp::stdio::ToolMode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: SpinrArgs = argh::from_env();
 
     // Engine child mode: read config from stdin pipe, run mio event loop, write metrics to stdout
     if args.run_engine {
         loadtest::orchestrator::run_engine_child()?;
-        return Ok(());
-    }
-
-    // Worker mode: run worker loop directly (no async runtime needed)
-    if let Some(config_json) = args.run_worker {
-        let config: loadtest::types::WorkerConfig = serde_json::from_str(&config_json)?;
-        loadtest::worker::run(config)?;
-        return Ok(());
-    }
-
-    // Manager mode: spawn workers and coordinate (no async runtime needed)
-    if let Some(config_json) = args.run_manager {
-        init_tracing();
-        let config: loadtest::types::TestConfig = serde_json::from_str(&config_json)?;
-        loadtest::manager::run(config)?;
         return Ok(());
     }
 
@@ -42,6 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .install_default()
             .expect("Failed to install ring crypto provider");
         mcp::stdio::run(ToolMode::All)?;
+        return Ok(());
+    }
+
+    // Bench subcommand: no async runtime needed
+    if let Some(SubCommand::Bench(ref cmd)) = args.command {
+        bench::run_bench(&cmd.config, cmd.json)?;
         return Ok(());
     }
 
@@ -90,6 +88,10 @@ async fn async_main(args: SpinrArgs) -> Result<(), Box<dyn std::error::Error + S
                 run_loadtest_cli(cmd)
             }
         }
+        Some(SubCommand::Bench(_)) => {
+            // Handled before tokio runtime is created in main()
+            unreachable!()
+        }
         None => {
             // No subcommand and no --mcp: show help
             eprintln!("Usage: spinr <command> [options]");
@@ -97,6 +99,7 @@ async fn async_main(args: SpinrArgs) -> Result<(), Box<dyn std::error::Error + S
             eprintln!("Commands:");
             eprintln!("  trace      Trace HTTP requests with detailed timing");
             eprintln!("  load-test  Run HTTP load tests (wrk2-style)");
+            eprintln!("  bench      Run multi-scenario benchmarks from TOML config");
             eprintln!();
             eprintln!("Flags:");
             eprintln!("  --mcp      Start as MCP server (all tools)");
@@ -184,124 +187,14 @@ async fn run_trace_cli(cmd: TraceCommand) -> Result<(), Box<dyn std::error::Erro
 
 /// Run load test in CLI mode (unified: both max-throughput and rate-limited)
 fn run_loadtest_cli(cmd: LoadTestCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::net::ToSocketAddrs;
-
-    let method: HttpMethod = cmd.method.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-    // Parse headers
-    let mut headers = HashMap::new();
-    for h in &cmd.header {
-        if let Some((name, value)) = h.split_once(':') {
-            headers.insert(name.trim().to_string(), value.trim().to_string());
-        } else {
-            return Err(format!("Invalid header format: '{}'. Use 'Name: Value'", h).into());
-        }
-    }
-
-    // Build pre-baked request bytes
-    let prepared =
-        loadtest::request::build_request_bytes(&cmd.url, method, &headers, cmd.body.as_deref())
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    // Resolve target address
-    let authority = &prepared.remote_addr_authority;
-    let addr_with_port = if authority.contains(':') {
-        authority.clone()
-    } else {
-        format!("{}:80", authority)
-    };
-    let remote_addr: SocketAddr = addr_with_port
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("DNS resolution failed for {}", authority))?;
-
-    let worker_count = cmd.threads.unwrap_or_else(|| num_cpus::get() as u32).max(1);
     let json = cmd.json;
-    let hdr_log = cmd.hdr_log.clone();
-
-    let mode = if cmd.max_throughput {
-        loadtest::types::EngineMode::MaxThroughput
-    } else {
-        loadtest::types::EngineMode::RateLimited {
-            requests_per_second: cmd.rate as u64,
-            latency_correction: true,
-        }
-    };
-
-    // Distribute connections across workers
-    let total_connections = if cmd.max_throughput {
-        cmd.connections.max(worker_count)
-    } else {
-        cmd.connections.max(1)
-    };
-
-    loadtest::preflight::run_preflight(total_connections, worker_count, json)?;
-
-    let mut configs = Vec::with_capacity(worker_count as usize);
-    for worker_id in 0..worker_count {
-        let base = total_connections / worker_count;
-        let extra = if worker_id < (total_connections % worker_count) {
-            1
-        } else {
-            0
-        };
-        let conns = (base + extra).max(1);
-
-        configs.push(loadtest::types::EngineConfig {
-            worker_id,
-            remote_addr,
-            method,
-            connections: conns,
-            duration_seconds: cmd.duration,
-            warmup_seconds: cmd.warmup,
-            mode: mode.clone(),
-            read_buffer_size: 8192,
-            verify_body: cmd.verify_body,
-        });
-    }
-
-    // Print test info
-    macro_rules! out {
-        ($($arg:tt)*) => {
-            if json { eprintln!($($arg)*); } else { println!($($arg)*); }
-        };
-    }
-    if cmd.max_throughput {
-        out!("Starting max-throughput test:");
-    } else {
-        out!("Starting load test:");
-        out!("  Rate:        {} RPS", cmd.rate);
-    }
-    out!("  URL:         {}", cmd.url);
-    out!("  Method:      {}", method);
-    out!("  Target:      {}", remote_addr);
-    out!("  Connections: {}", total_connections);
-    out!("  Workers:     {}", worker_count);
-    if cmd.warmup > 0 {
-        out!("  Warmup:      {}s", cmd.warmup);
-    }
-    out!("  Duration:    {}s", cmd.duration);
-    out!();
-
-    // Run the test
-    let raw_results = loadtest::orchestrator::run_workers(configs, &prepared.bytes)?;
-
-    // Convert to public metrics
-    let worker_metrics: Vec<_> = raw_results
-        .into_iter()
-        .map(|r| r.into_worker_metrics())
-        .collect();
-    let metrics = MergedMetrics::from_workers(&worker_metrics);
+    let params = bench::LoadTestParams::from_cli(&cmd)?;
+    let metrics = bench::run_single_loadtest(&params, json)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&metrics).unwrap());
     } else {
         output::print_metrics(&metrics);
-    }
-
-    if let Some(ref path) = hdr_log {
-        output::write_hdr_log(std::path::Path::new(path), &metrics)?;
-        eprintln!("HDR Histogram log written to {}", path);
     }
 
     Ok(())

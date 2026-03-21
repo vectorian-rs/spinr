@@ -12,14 +12,6 @@ pub struct SpinrArgs {
     #[argh(switch)]
     pub mcp: bool,
 
-    /// run as manager process (internal use)
-    #[argh(option)]
-    pub run_manager: Option<String>,
-
-    /// run as worker process (internal use)
-    #[argh(option)]
-    pub run_worker: Option<String>,
-
     /// run as engine child process (internal use, reads config from stdin pipe)
     #[argh(switch)]
     pub run_engine: bool,
@@ -30,6 +22,20 @@ pub struct SpinrArgs {
 pub enum SubCommand {
     Trace(TraceCommand),
     LoadTest(LoadTestCommand),
+    Bench(BenchCommand),
+}
+
+/// Run multi-scenario benchmarks from a TOML config file
+#[derive(FromArgs, Debug)]
+#[argh(subcommand, name = "bench")]
+pub struct BenchCommand {
+    /// path to TOML benchmark config file
+    #[argh(positional)]
+    pub config: String,
+
+    /// output as JSON
+    #[argh(switch, short = 'j')]
+    pub json: bool,
 }
 
 /// Trace HTTP requests with detailed timing breakdown

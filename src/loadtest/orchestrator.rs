@@ -12,15 +12,26 @@
 //! Child → Parent (stdout at shutdown):
 //!   [4 bytes: metrics_json_len] [metrics_json_bytes]
 
+use crate::loadtest::engine::EngineError;
 use crate::loadtest::types::{EngineConfig, RawWorkerMetrics};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+
+#[derive(Debug, thiserror::Error)]
+pub enum OrchestratorError {
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Engine(#[from] EngineError),
+}
 
 /// Spawn N worker processes, wait for completion, collect metrics.
 pub fn run_workers(
     configs: Vec<EngineConfig>,
     request_bytes: &[u8],
-) -> anyhow::Result<Vec<RawWorkerMetrics>> {
+) -> Result<Vec<RawWorkerMetrics>, OrchestratorError> {
     let exe = std::env::current_exe()?;
     let mut children: Vec<(u32, Child)> = Vec::with_capacity(configs.len());
 
@@ -94,7 +105,7 @@ pub fn run_workers(
 
 /// Child-process entry point: read config and request bytes from stdin,
 /// run the engine, write metrics to stdout.
-pub fn run_engine_child() -> anyhow::Result<()> {
+pub fn run_engine_child() -> Result<(), OrchestratorError> {
     let mut stdin = std::io::stdin().lock();
 
     let config_json = read_frame(&mut stdin)?;

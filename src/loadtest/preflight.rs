@@ -3,6 +3,33 @@
 /// Verifies kernel limits won't silently break a benchmark run.
 /// On non-Linux platforms, all checks are skipped.
 
+#[derive(Debug, thiserror::Error)]
+#[allow(dead_code)] // variants used on Linux only
+pub enum PreflightError {
+    #[error(
+        "nofile soft limit is too low for {connections} connections + {workers} workers (required: {required} FDs)"
+    )]
+    NofileTooLow {
+        connections: u32,
+        workers: u32,
+        required: u32,
+    },
+    #[error("failed to read {path}: {source}")]
+    ReadFile {
+        path: &'static str,
+        source: std::io::Error,
+    },
+    #[error("failed to parse {what}: {source}")]
+    ParseInt {
+        what: &'static str,
+        source: std::num::ParseIntError,
+    },
+    #[error("'Max open files' line not found in /proc/self/limits")]
+    NofileLineNotFound,
+    #[error("unexpected format in ip_local_port_range")]
+    UnexpectedPortRangeFormat,
+}
+
 /// Compute the number of file descriptors required for a test run.
 #[cfg(any(target_os = "linux", test))]
 pub fn required_fds(total_connections: u32, worker_count: u32) -> u32 {
@@ -14,7 +41,7 @@ pub fn run_preflight(
     _total_connections: u32,
     _worker_count: u32,
     _json: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), PreflightError> {
     Ok(())
 }
 
@@ -23,9 +50,7 @@ pub fn run_preflight(
     total_connections: u32,
     worker_count: u32,
     json: bool,
-) -> anyhow::Result<()> {
-    use anyhow::{bail, Context};
-
+) -> Result<(), PreflightError> {
     macro_rules! out {
         ($($arg:tt)*) => {
             if json { eprintln!($($arg)*); } else { println!($($arg)*); }
@@ -33,15 +58,12 @@ pub fn run_preflight(
     }
 
     let required = required_fds(total_connections, worker_count);
-    let mut any_fail = false;
-
     out!("Linux startup checks:");
 
     // 1. nofile soft/hard from /proc/self/limits
     let (nofile_tag, nofile_fail) = match parse_nofile_limits() {
         Ok((soft, hard)) => {
             let status = if soft < required as u64 {
-                any_fail = true;
                 format!("FAIL (required: {})", required)
             } else if hard < (required as u64) * 2 {
                 format!("WARN (hard limit < 2x required {})", required * 2)
@@ -89,23 +111,24 @@ pub fn run_preflight(
     out!();
 
     if nofile_fail {
-        bail!(
-            "nofile soft limit is too low for {} connections + {} workers (required: {} FDs)",
-            total_connections,
-            worker_count,
-            required
-        );
+        return Err(PreflightError::NofileTooLow {
+            connections: total_connections,
+            workers: worker_count,
+            required,
+        });
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn parse_nofile_limits() -> anyhow::Result<(u64, u64)> {
-    use anyhow::Context;
-
-    let contents = std::fs::read_to_string("/proc/self/limits")
-        .context("failed to read /proc/self/limits")?;
+fn parse_nofile_limits() -> Result<(u64, u64), PreflightError> {
+    let contents = std::fs::read_to_string("/proc/self/limits").map_err(|source| {
+        PreflightError::ReadFile {
+            path: "/proc/self/limits",
+            source,
+        }
+    })?;
 
     for line in contents.lines() {
         if line.starts_with("Max open files") {
@@ -118,55 +141,76 @@ fn parse_nofile_limits() -> anyhow::Result<(u64, u64)> {
                 } else {
                     nums[0]
                         .parse::<u64>()
-                        .context("failed to parse nofile soft limit")?
+                        .map_err(|source| PreflightError::ParseInt {
+                            what: "nofile soft limit",
+                            source,
+                        })?
                 };
                 let hard = if nums[1] == "unlimited" {
                     u64::MAX
                 } else {
                     nums[1]
                         .parse::<u64>()
-                        .context("failed to parse nofile hard limit")?
+                        .map_err(|source| PreflightError::ParseInt {
+                            what: "nofile hard limit",
+                            source,
+                        })?
                 };
                 return Ok((soft, hard));
             }
         }
     }
 
-    anyhow::bail!("'Max open files' line not found in /proc/self/limits")
+    Err(PreflightError::NofileLineNotFound)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_port_range() -> anyhow::Result<(u32, u32)> {
-    use anyhow::Context;
-
-    let contents = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .context("failed to read /proc/sys/net/ipv4/ip_local_port_range")?;
+fn parse_port_range() -> Result<(u32, u32), PreflightError> {
+    let contents =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").map_err(|source| {
+            PreflightError::ReadFile {
+                path: "/proc/sys/net/ipv4/ip_local_port_range",
+                source,
+            }
+        })?;
 
     let parts: Vec<&str> = contents.trim().split_whitespace().collect();
     if parts.len() >= 2 {
         let low = parts[0]
             .parse::<u32>()
-            .context("failed to parse port range low")?;
+            .map_err(|source| PreflightError::ParseInt {
+                what: "port range low",
+                source,
+            })?;
         let high = parts[1]
             .parse::<u32>()
-            .context("failed to parse port range high")?;
+            .map_err(|source| PreflightError::ParseInt {
+                what: "port range high",
+                source,
+            })?;
         return Ok((low, high));
     }
 
-    anyhow::bail!("unexpected format in ip_local_port_range")
+    Err(PreflightError::UnexpectedPortRangeFormat)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_tcp_tw_reuse() -> anyhow::Result<u32> {
-    use anyhow::Context;
-
-    let contents = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_tw_reuse")
-        .context("failed to read /proc/sys/net/ipv4/tcp_tw_reuse")?;
+fn parse_tcp_tw_reuse() -> Result<u32, PreflightError> {
+    let contents =
+        std::fs::read_to_string("/proc/sys/net/ipv4/tcp_tw_reuse").map_err(|source| {
+            PreflightError::ReadFile {
+                path: "/proc/sys/net/ipv4/tcp_tw_reuse",
+                source,
+            }
+        })?;
 
     contents
         .trim()
         .parse::<u32>()
-        .context("failed to parse tcp_tw_reuse value")
+        .map_err(|source| PreflightError::ParseInt {
+            what: "tcp_tw_reuse value",
+            source,
+        })
 }
 
 #[cfg(test)]

@@ -8,13 +8,19 @@ use crate::mcp::{
 };
 use crate::trace;
 use serde_json::{Value, json};
-use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
-use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tokio::runtime::Runtime;
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpStdioError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+}
 
 /// Which tool set(s) this server exposes
 #[derive(Debug, Clone, Copy)]
@@ -27,10 +33,10 @@ pub enum ToolMode {
     All,
 }
 
-/// State shared across the MCP server (for load test child process tracking)
+/// State shared across the MCP server (for load test tracking)
 pub struct ServerState {
-    /// Currently running test process (manager)
-    pub child: Mutex<Option<Child>>,
+    /// Join handle for the load test thread
+    pub join_handle: Mutex<Option<JoinHandle<Result<MergedMetrics, String>>>>,
     /// Status of current/last test
     pub status: Mutex<TestStatus>,
 }
@@ -38,14 +44,14 @@ pub struct ServerState {
 impl ServerState {
     pub fn new() -> Self {
         Self {
-            child: Mutex::new(None),
+            join_handle: Mutex::new(None),
             status: Mutex::new(TestStatus::default()),
         }
     }
 }
 
 /// Run the MCP stdio server loop
-pub fn run(mode: ToolMode) -> anyhow::Result<()> {
+pub fn run(mode: ToolMode) -> Result<(), McpStdioError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let state = Arc::new(ServerState::new());
@@ -90,18 +96,9 @@ async fn handle_request(
     match request.method.as_str() {
         "initialize" => handle_initialize(request.id),
         "notifications/initialized" => {
-            // Client acknowledgment, no response needed for notifications
-            // But we still need to return something since we always write a response
-            // Actually, notifications have no id and expect no response.
-            // We'll return an empty success if it has an id, otherwise skip.
             if request.id.is_some() {
                 JsonRpcResponse::success(request.id, json!({}))
             } else {
-                // For notifications, we should not send a response, but our loop
-                // always writes one. Return a dummy that the caller can filter.
-                // Actually, in the stdio loop we always write - this is fine per
-                // JSON-RPC spec for notifications we should not respond. Let's
-                // handle this by returning a success with null id.
                 JsonRpcResponse::success(None, json!({}))
             }
         }
@@ -292,7 +289,7 @@ fn loadtest_tool_definitions() -> Vec<McpTool> {
         ),
         McpTool::new(
             "stop_load_test",
-            "Stop the currently running load test.",
+            "Stop the currently running load test. Note: tests run to completion and cannot be cancelled mid-flight.",
             json!({
                 "type": "object",
                 "properties": {}
@@ -310,9 +307,12 @@ fn loadtest_tool_definitions() -> Vec<McpTool> {
 }
 
 fn handle_start_load_test(state: &Arc<ServerState>, args: Value) -> Result<String, String> {
+    // Check if a test is already running
     {
-        let child = state.child.lock().map_err(|e| e.to_string())?;
-        if child.is_some() {
+        let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
+        if let Some(ref h) = *handle
+            && !h.is_finished()
+        {
             return Err(
                 "A load test is already running. Stop it first with stop_load_test.".to_string(),
             );
@@ -320,56 +320,69 @@ fn handle_start_load_test(state: &Arc<ServerState>, args: Value) -> Result<Strin
     }
 
     let args: StartLoadTestArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-    let mut config = args.into_config()?;
+    let target_url = args.target_url.clone();
+    let method_str = args.method.clone().unwrap_or_else(|| "GET".to_string());
+    let total_rate = args.total_rate;
+    let duration_seconds = args.duration_seconds;
+    let process_count = args.process_count;
 
-    let metrics_dir = std::env::temp_dir().join(format!("spinr-loadtest-{}", std::process::id()));
-    fs::create_dir_all(&metrics_dir).map_err(|e| format!("Failed to create metrics dir: {}", e))?;
-    let metrics_dir_str = metrics_dir.to_string_lossy().to_string();
-    config.metrics_dir = Some(metrics_dir_str.clone());
+    let params = args.into_load_test_params()?;
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let config_json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
-
-    let child = Command::new(exe)
-        .arg("--run-manager")
-        .arg(&config_json)
-        .spawn()
-        .map_err(|e| format!("Failed to spawn manager: {}", e))?;
-
-    let pid = child.id();
     let start_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| format_iso8601(d.as_secs()))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    {
-        let mut child_guard = state.child.lock().map_err(|e| e.to_string())?;
-        *child_guard = Some(child);
-    }
+    // Update status to running
     {
         let mut status = state.status.lock().map_err(|e| e.to_string())?;
         *status = TestStatus {
             running: true,
             completed: None,
-            pid: Some(pid),
             start_time: Some(start_time.clone()),
             end_time: None,
-            config: Some(config.clone()),
-            metrics_dir: Some(metrics_dir_str),
             metrics: None,
         };
     }
 
+    // Spawn a thread to run the load test
+    let state_clone = Arc::clone(state);
+    let handle = std::thread::spawn(move || {
+        let result = crate::bench::run_single_loadtest(&params, true).map_err(|e| e.to_string());
+
+        // Update status on completion
+        let end_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| format_iso8601(d.as_secs()))
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        if let Ok(mut status) = state_clone.status.lock() {
+            status.running = false;
+            status.completed = Some(result.is_ok());
+            status.end_time = Some(end_time);
+            if let Ok(ref metrics) = result {
+                status.metrics = Some(metrics.clone());
+            }
+        }
+
+        result
+    });
+
+    // Store the join handle
+    {
+        let mut handle_guard = state.join_handle.lock().map_err(|e| e.to_string())?;
+        *handle_guard = Some(handle);
+    }
+
     let response = json!({
         "started": true,
-        "pid": pid,
         "start_time": start_time,
         "config": {
-            "target_url": config.target_url,
-            "method": config.method.to_string(),
-            "total_rate": config.total_rate,
-            "process_count": config.process_count,
-            "duration_seconds": config.duration_seconds
+            "target_url": target_url,
+            "method": method_str,
+            "total_rate": total_rate,
+            "process_count": process_count,
+            "duration_seconds": duration_seconds
         }
     });
 
@@ -377,94 +390,35 @@ fn handle_start_load_test(state: &Arc<ServerState>, args: Value) -> Result<Strin
 }
 
 fn handle_stop_load_test(state: &Arc<ServerState>) -> Result<String, String> {
-    let mut child_guard = state.child.lock().map_err(|e| e.to_string())?;
+    let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
 
-    match child_guard.take() {
-        Some(mut child) => {
-            let pid = child.id();
-            child
-                .kill()
-                .map_err(|e| format!("Failed to kill process: {}", e))?;
-
-            let end_time = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| format_iso8601(d.as_secs()))
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            {
-                let mut status = state.status.lock().map_err(|e| e.to_string())?;
-                status.running = false;
-                status.completed = Some(false);
-                status.end_time = Some(end_time);
-            }
-
-            Ok(format!("Stopped load test (PID: {})", pid))
+    match *handle {
+        Some(ref h) if !h.is_finished() => Err(
+            "Load tests run to completion and cannot be cancelled mid-flight. \
+             Wait for the test to finish or check status with get_status."
+                .to_string(),
+        ),
+        Some(_) => {
+            Err("No load test is currently running (last test already completed)".to_string())
         }
         None => Err("No load test is currently running".to_string()),
     }
 }
 
 fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
-    let (still_running, just_completed) = {
-        let mut child_guard = state.child.lock().map_err(|e| e.to_string())?;
-        if let Some(ref mut child) = *child_guard {
-            match child.try_wait() {
-                Ok(Some(_exit_status)) => {
-                    *child_guard = None;
-                    (false, true)
-                }
-                Ok(None) => (true, false),
-                Err(_) => {
-                    *child_guard = None;
-                    (false, true)
-                }
-            }
-        } else {
-            (false, false)
-        }
-    };
-
-    let mut status = state.status.lock().map_err(|e| e.to_string())?;
-    status.running = still_running;
-
-    if just_completed && status.completed.is_none() {
-        let end_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| format_iso8601(d.as_secs()))
-            .unwrap_or_else(|_| "unknown".to_string());
-        status.completed = Some(true);
-        status.end_time = Some(end_time);
-
-        if let Some(ref metrics_dir) = status.metrics_dir {
-            status.metrics = load_merged_metrics(metrics_dir);
-        }
-    }
-
-    if status.completed == Some(true)
-        && status.metrics.is_none()
-        && let Some(ref metrics_dir) = status.metrics_dir
+    // Check if the thread has finished and update status accordingly
     {
-        status.metrics = load_merged_metrics(metrics_dir);
-    }
-
-    Ok(serde_json::to_string_pretty(&*status).unwrap())
-}
-
-fn load_merged_metrics(metrics_dir: &str) -> Option<MergedMetrics> {
-    let path = Path::new(metrics_dir).join("merged_metrics.json");
-    match fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str::<MergedMetrics>(&content) {
-            Ok(metrics) => Some(metrics),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to parse merged metrics");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::debug!(error = %e, "Merged metrics file not found yet");
-            None
+        let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
+        if let Some(ref h) = *handle
+            && h.is_finished()
+        {
+            let mut status = state.status.lock().map_err(|e| e.to_string())?;
+            status.running = false;
         }
     }
+
+    let status = state.status.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::to_string_pretty(&*status).unwrap())
 }
 
 // ── Helpers ──

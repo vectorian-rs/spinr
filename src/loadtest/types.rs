@@ -183,71 +183,15 @@ impl std::str::FromStr for HttpMethod {
     }
 }
 
-/// Configuration for max-throughput (closed-loop) benchmark mode
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct MaxThroughputConfig {
-    pub target_url: String,
-    pub method: HttpMethod,
-    pub headers: HashMap<String, String>,
-    pub body: Option<String>,
-    /// Number of concurrent connections (async tasks)
-    pub connections: u32,
-    /// Test duration in seconds
-    pub duration_seconds: u32,
-    /// Warmup duration in seconds (requests sent but not recorded)
-    pub warmup_seconds: u32,
-}
-
-/// Configuration for a load test
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestConfig {
-    /// Target URL to test
-    pub target_url: String,
-
-    /// HTTP method (GET, POST, etc.)
-    #[serde(default)]
-    pub method: HttpMethod,
-
-    /// HTTP headers to include in requests
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-
-    /// Request body (for POST, PUT, PATCH)
-    #[serde(default)]
-    pub body: Option<String>,
-
-    /// Total requests per second across all workers
-    pub total_rate: u32,
-
-    /// Number of worker processes
-    pub process_count: u32,
-
-    /// Test duration in seconds
-    pub duration_seconds: u32,
-
-    /// Warmup duration in seconds (requests sent but not recorded)
-    #[serde(default)]
-    pub warmup_seconds: u32,
-
-    /// Directory for metrics files (set by MCP server)
-    #[serde(default)]
-    pub metrics_dir: Option<String>,
-}
-
 /// Current status of a load test
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TestStatus {
     /// Whether a test is currently running
     pub running: bool,
 
-    /// Whether the test completed naturally (vs manually stopped)
+    /// Whether the test completed naturally
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed: Option<bool>,
-
-    /// Process ID of the manager (if running)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
 
     /// When the test started (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,14 +200,6 @@ pub struct TestStatus {
     /// When the test ended (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_time: Option<String>,
-
-    /// Configuration of the running/last test
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<TestConfig>,
-
-    /// Directory containing metrics files
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics_dir: Option<String>,
 
     /// Merged metrics from all workers (populated after completion)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,18 +236,12 @@ pub struct StartLoadTestArgs {
 }
 
 impl StartLoadTestArgs {
-    /// Convert to TestConfig with defaults applied
-    pub fn into_config(self) -> Result<TestConfig, String> {
+    /// Convert to LoadTestParams with defaults applied
+    pub fn into_load_test_params(self) -> Result<crate::bench::LoadTestParams, String> {
         let method = match &self.method {
             Some(m) => m.parse()?,
             None => HttpMethod::GET,
         };
-
-        let process_count = self.process_count.unwrap_or_else(|| num_cpus::get() as u32);
-
-        if process_count == 0 {
-            return Err("process_count must be at least 1".to_string());
-        }
 
         if self.total_rate == 0 {
             return Err("total_rate must be at least 1".to_string());
@@ -321,51 +251,21 @@ impl StartLoadTestArgs {
             return Err("duration_seconds must be at least 1".to_string());
         }
 
-        Ok(TestConfig {
-            target_url: self.target_url,
+        Ok(crate::bench::LoadTestParams {
+            url: self.target_url,
             method,
             headers: self.headers.unwrap_or_default(),
             body: self.body,
-            total_rate: self.total_rate,
-            process_count,
-            duration_seconds: self.duration_seconds,
-            warmup_seconds: 0,
-            metrics_dir: None,
+            connections: 1,
+            duration: self.duration_seconds,
+            warmup: 0,
+            max_throughput: false,
+            rate: self.total_rate,
+            threads: self.process_count,
+            verify_body: false,
+            hdr_log: None,
         })
     }
-}
-
-/// Worker configuration passed via command line
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    /// Target URL
-    pub target_url: String,
-
-    /// HTTP method
-    pub method: HttpMethod,
-
-    /// HTTP headers
-    pub headers: HashMap<String, String>,
-
-    /// Request body
-    pub body: Option<String>,
-
-    /// Requests per second for this worker
-    pub rate: u32,
-
-    /// Duration in seconds
-    pub duration_seconds: u32,
-
-    /// Warmup duration in seconds (requests sent but not recorded)
-    #[serde(default)]
-    pub warmup_seconds: u32,
-
-    /// Worker ID for metrics file naming
-    pub worker_id: u32,
-
-    /// Directory to write metrics to
-    #[serde(default)]
-    pub metrics_dir: Option<String>,
 }
 
 /// High-precision latency histogram using HdrHistogram
@@ -682,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_start_args_to_config() {
+    fn test_start_args_to_load_test_params() {
         let args = StartLoadTestArgs {
             target_url: "http://localhost:3000".to_string(),
             method: Some("POST".to_string()),
@@ -696,17 +596,19 @@ mod tests {
             duration_seconds: 30,
         };
 
-        let config = args.into_config().unwrap();
-        assert_eq!(config.method, HttpMethod::POST);
-        assert_eq!(config.process_count, 4);
+        let params = args.into_load_test_params().unwrap();
+        assert_eq!(params.method, HttpMethod::POST);
+        assert_eq!(params.threads, Some(4));
+        assert_eq!(params.rate, 1000);
+        assert_eq!(params.duration, 30);
         assert_eq!(
-            config.headers.get("Content-Type").unwrap(),
+            params.headers.get("Content-Type").unwrap(),
             "application/json"
         );
     }
 
     #[test]
-    fn test_config_defaults() {
+    fn test_load_test_params_defaults() {
         let args = StartLoadTestArgs {
             target_url: "http://localhost:3000".to_string(),
             method: None,
@@ -717,14 +619,14 @@ mod tests {
             duration_seconds: 10,
         };
 
-        let config = args.into_config().unwrap();
-        assert_eq!(config.method, HttpMethod::GET);
-        assert!(config.process_count > 0);
-        assert!(config.headers.is_empty());
+        let params = args.into_load_test_params().unwrap();
+        assert_eq!(params.method, HttpMethod::GET);
+        assert_eq!(params.threads, None);
+        assert!(params.headers.is_empty());
     }
 
     #[test]
-    fn test_invalid_config() {
+    fn test_invalid_load_test_params() {
         let args = StartLoadTestArgs {
             target_url: "http://localhost:3000".to_string(),
             method: None,
@@ -735,7 +637,7 @@ mod tests {
             duration_seconds: 10,
         };
 
-        assert!(args.into_config().is_err());
+        assert!(args.into_load_test_params().is_err());
     }
 
     #[test]
