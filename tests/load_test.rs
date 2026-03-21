@@ -36,6 +36,10 @@ fn rate_limited_json_output() {
     assert!(json["latency_p50_ms"].is_number());
     assert!(json["latency_p99_ms"].is_number());
     assert!(json["duration_secs"].is_number());
+    assert!(json["payload_bytes"].is_number());
+    assert!(json["wire_bytes"].is_number());
+    assert!(json["payload_transfer_per_sec"].is_number());
+    assert!(json["wire_transfer_per_sec"].is_number());
 }
 
 #[test]

@@ -29,6 +29,28 @@ struct RunWindow {
     can_start_requests: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResponseAccounting {
+    payload_bytes: u64,
+    wire_bytes: u64,
+}
+
+impl ResponseAccounting {
+    fn payload_only(bytes: u64) -> Self {
+        Self {
+            payload_bytes: bytes,
+            wire_bytes: bytes,
+        }
+    }
+}
+
+impl std::ops::AddAssign for ResponseAccounting {
+    fn add_assign(&mut self, rhs: Self) {
+        self.payload_bytes += rhs.payload_bytes;
+        self.wire_bytes += rhs.wire_bytes;
+    }
+}
+
 impl RawWorkerMetrics {
     fn new(worker_id: u32, corrected: bool) -> Self {
         Self {
@@ -40,7 +62,8 @@ impl RawWorkerMetrics {
             latency_uncorrected: HdrLatencyHistogram::default(),
             latency_corrected: corrected.then(HdrLatencyHistogram::default),
             duration_secs: 0.0,
-            total_bytes: 0,
+            payload_bytes: 0,
+            wire_bytes: 0,
         }
     }
 
@@ -49,11 +72,12 @@ impl RawWorkerMetrics {
         status_code: Option<u16>,
         request_start: Instant,
         scheduled_start: Option<Instant>,
-        body_len: u64,
+        accounting: ResponseAccounting,
         is_transport_error: bool,
     ) {
         self.request_count += 1;
-        self.total_bytes += body_len;
+        self.payload_bytes += accounting.payload_bytes;
+        self.wire_bytes += accounting.wire_bytes;
 
         let uncorrected_us = request_start.elapsed().as_micros() as u64;
         self.latency_uncorrected.record(uncorrected_us.max(1));
@@ -285,7 +309,13 @@ fn handle_connection_failure(
     if let Some((request_start, scheduled_start, measure_request)) = connection.fail_request()
         && measure_request
     {
-        metrics.record_response(None, request_start, scheduled_start, 0, true);
+        metrics.record_response(
+            None,
+            request_start,
+            scheduled_start,
+            ResponseAccounting::default(),
+            true,
+        );
     }
 
     connection.close(poll);
@@ -421,7 +451,7 @@ fn handle_readable(
                                                 Some(status_code),
                                                 request_start,
                                                 scheduled_start,
-                                                0,
+                                                ResponseAccounting::default(),
                                                 false,
                                             );
                                         }
@@ -439,7 +469,9 @@ fn handle_readable(
                                                     Some(status_code),
                                                     request_start,
                                                     scheduled_start,
-                                                    total_len as u64,
+                                                    ResponseAccounting::payload_only(
+                                                        total_len as u64,
+                                                    ),
                                                     false,
                                                 );
                                             }
@@ -466,14 +498,14 @@ fn handle_readable(
                                         let buffered =
                                             &connection.read_buf[body_start..connection.read_len];
                                         let mut decoder = ChunkedDecoder::new();
-                                        let consumed = decoder.feed(buffered) as u64;
-                                        if decoder.is_done() {
+                                        let progress = decoder.feed(buffered);
+                                        if progress.complete {
                                             if measure_request {
                                                 metrics.record_response(
                                                     Some(status_code),
                                                     request_start,
                                                     scheduled_start,
-                                                    consumed,
+                                                    progress.accounting,
                                                     false,
                                                 );
                                             }
@@ -488,7 +520,7 @@ fn handle_readable(
                                             status_code,
                                             should_close,
                                             decoder,
-                                            bytes_received: consumed,
+                                            accounting: progress.accounting,
                                         };
                                         connection.read_len = 0;
                                         connection.reregister(poll, Interest::READABLE)?;
@@ -540,7 +572,7 @@ fn handle_readable(
                                     Some(status_code),
                                     connection.request_start.unwrap_or_else(Instant::now),
                                     connection.scheduled_start,
-                                    total_body_len,
+                                    ResponseAccounting::payload_only(total_body_len),
                                     false,
                                 );
                             }
@@ -578,7 +610,7 @@ fn handle_readable(
             status_code,
             should_close,
             mut decoder,
-            mut bytes_received,
+            mut accounting,
         } => {
             let Some(stream) = connection.stream.as_mut() else {
                 return Ok(());
@@ -595,15 +627,15 @@ fn handle_readable(
                         );
                     }
                     Ok(read) => {
-                        let consumed = decoder.feed(&connection.read_buf[..read]);
-                        bytes_received += consumed as u64;
-                        if decoder.is_done() {
+                        let progress = decoder.feed(&connection.read_buf[..read]);
+                        accounting += progress.accounting;
+                        if progress.complete {
                             if connection.measure_request {
                                 metrics.record_response(
                                     Some(status_code),
                                     connection.request_start.unwrap_or_else(Instant::now),
                                     connection.scheduled_start,
-                                    bytes_received,
+                                    accounting,
                                     false,
                                 );
                             }
@@ -616,7 +648,7 @@ fn handle_readable(
                             status_code,
                             should_close,
                             decoder,
-                            bytes_received,
+                            accounting,
                         };
                         return Ok(());
                     }
@@ -721,9 +753,18 @@ enum ChunkedDecoder {
     PostDataCrlf { need: u8 },
     /// After the last-chunk (size 0): scanning for the empty line that ends
     /// the trailer section. `matched` counts consecutive bytes of `\r\n`.
-    Trailers { matched: u8 },
+    Trailers {
+        line_has_bytes: bool,
+        pending_cr: bool,
+    },
     /// Terminal state — the complete chunked body has been consumed.
     Done,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChunkedProgress {
+    accounting: ResponseAccounting,
+    complete: bool,
 }
 
 impl ChunkedDecoder {
@@ -738,10 +779,11 @@ impl ChunkedDecoder {
         matches!(self, ChunkedDecoder::Done)
     }
 
-    /// Feed bytes into the decoder. Returns the number of bytes consumed
-    /// (always `<= buf.len()`). After this call, check `is_done()`.
-    fn feed(&mut self, buf: &[u8]) -> usize {
+    /// Feed bytes into the decoder, returning wire and payload byte accounting
+    /// for this chunk of input plus the completion state after the feed.
+    fn feed(&mut self, buf: &[u8]) -> ChunkedProgress {
         let mut pos = 0;
+        let mut payload_bytes = 0;
         while pos < buf.len() && !self.is_done() {
             match self {
                 ChunkedDecoder::SizeLine { size, in_ext } => {
@@ -751,7 +793,10 @@ impl ChunkedDecoder {
                         // End of size line
                         if *size == 0 {
                             // Last chunk → scan trailers
-                            *self = ChunkedDecoder::Trailers { matched: 0 };
+                            *self = ChunkedDecoder::Trailers {
+                                line_has_bytes: false,
+                                pending_cr: false,
+                            };
                         } else {
                             *self = ChunkedDecoder::Data { remaining: *size };
                         }
@@ -759,9 +804,7 @@ impl ChunkedDecoder {
                         // Part of CRLF, ignore
                     } else if b == b';' {
                         *in_ext = true;
-                    } else if !*in_ext
-                        && let Some(digit) = hex_digit(b)
-                    {
+                    } else if !*in_ext && let Some(digit) = hex_digit(b) {
                         *size = size.wrapping_mul(16).wrapping_add(digit as u64);
                         // Non-hex chars before ';' are malformed; be lenient.
                     }
@@ -770,6 +813,7 @@ impl ChunkedDecoder {
                     let avail = (buf.len() - pos) as u64;
                     let skip = avail.min(*remaining);
                     pos += skip as usize;
+                    payload_bytes += skip;
                     *remaining -= skip;
                     if *remaining == 0 {
                         *self = ChunkedDecoder::PostDataCrlf { need: 2 };
@@ -785,20 +829,43 @@ impl ChunkedDecoder {
                         };
                     }
                 }
-                ChunkedDecoder::Trailers { matched } => {
+                ChunkedDecoder::Trailers {
+                    line_has_bytes,
+                    pending_cr,
+                } => {
                     let b = buf[pos];
                     pos += 1;
-                    match (*matched, b) {
-                        (0, b'\r') => *matched = 1,
-                        (1, b'\n') => *self = ChunkedDecoder::Done,
-                        (_, b'\r') => *matched = 1,
-                        _ => *matched = 0,
+                    if *pending_cr {
+                        if b == b'\n' {
+                            if *line_has_bytes {
+                                *line_has_bytes = false;
+                                *pending_cr = false;
+                            } else {
+                                *self = ChunkedDecoder::Done;
+                            }
+                        } else if b == b'\r' {
+                            *line_has_bytes = true;
+                            *pending_cr = true;
+                        } else {
+                            *line_has_bytes = true;
+                            *pending_cr = false;
+                        }
+                    } else if b == b'\r' {
+                        *pending_cr = true;
+                    } else {
+                        *line_has_bytes = true;
                     }
                 }
                 ChunkedDecoder::Done => break,
             }
         }
-        pos
+        ChunkedProgress {
+            accounting: ResponseAccounting {
+                payload_bytes,
+                wire_bytes: pos as u64,
+            },
+            complete: self.is_done(),
+        }
     }
 }
 
@@ -848,7 +915,7 @@ enum ConnectionState {
         status_code: u16,
         should_close: bool,
         decoder: ChunkedDecoder,
-        bytes_received: u64,
+        accounting: ResponseAccounting,
     },
     Closed,
 }
@@ -1137,8 +1204,11 @@ mod tests {
     fn chunked_decoder_simple_body() {
         let mut dec = ChunkedDecoder::new();
         let input = b"4\r\ndata\r\n0\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert!(progress.complete);
+        assert_eq!(progress.accounting.payload_bytes, 4);
+        assert_eq!(progress.accounting.wire_bytes, input.len() as u64);
     }
 
     #[test]
@@ -1146,16 +1216,21 @@ mod tests {
         // Payload contains the bytes "0\r\n\r\n" but as data, not a terminal chunk
         let mut dec = ChunkedDecoder::new();
         let input = b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert!(progress.complete);
+        assert_eq!(progress.accounting.payload_bytes, 5);
     }
 
     #[test]
     fn chunked_decoder_with_trailers() {
         let mut dec = ChunkedDecoder::new();
         let input = b"2\r\nok\r\n0\r\nTrailer: val\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert!(progress.complete);
+        assert_eq!(progress.accounting.payload_bytes, 2);
+        assert_eq!(progress.accounting.wire_bytes, input.len() as u64);
     }
 
     #[test]
@@ -1163,47 +1238,57 @@ mod tests {
         let mut dec = ChunkedDecoder::new();
         let full = b"4\r\ndata\r\n0\r\n\r\n";
         // Feed one byte at a time
-        let mut total = 0;
+        let mut total_wire = 0;
+        let mut total_payload = 0;
         for &b in full.iter() {
-            total += dec.feed(&[b]);
+            let progress = dec.feed(&[b]);
+            total_wire += progress.accounting.wire_bytes as usize;
+            total_payload += progress.accounting.payload_bytes as usize;
             if dec.is_done() {
                 break;
             }
         }
         assert!(dec.is_done());
-        assert_eq!(total, full.len());
+        assert_eq!(total_wire, full.len());
+        assert_eq!(total_payload, 4);
     }
 
     #[test]
     fn chunked_decoder_multiple_chunks() {
         let mut dec = ChunkedDecoder::new();
         let input = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert_eq!(progress.accounting.payload_bytes, 6);
+        assert_eq!(progress.accounting.wire_bytes, input.len() as u64);
     }
 
     #[test]
     fn chunked_decoder_chunk_extension() {
         let mut dec = ChunkedDecoder::new();
         let input = b"4;ext=val\r\ndata\r\n0\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert_eq!(progress.accounting.payload_bytes, 4);
     }
 
     #[test]
     fn chunked_decoder_hex_uppercase() {
         let mut dec = ChunkedDecoder::new();
         let input = b"A\r\n0123456789\r\n0\r\n\r\n";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(dec.is_done());
+        assert_eq!(progress.accounting.payload_bytes, 10);
     }
 
     #[test]
     fn chunked_decoder_incomplete() {
         let mut dec = ChunkedDecoder::new();
         let input = b"4\r\nda";
-        dec.feed(input);
+        let progress = dec.feed(input);
         assert!(!dec.is_done());
+        assert!(!progress.complete);
+        assert_eq!(progress.accounting.payload_bytes, 2);
     }
 
     #[test]

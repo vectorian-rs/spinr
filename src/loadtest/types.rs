@@ -73,8 +73,15 @@ pub struct RawWorkerMetrics {
     pub latency_corrected: Option<HdrLatencyHistogram>,
     /// Actual measurement duration in seconds
     pub duration_secs: f64,
-    /// Total response body bytes received
-    pub total_bytes: u64,
+    /// Total decoded payload bytes received across all responses.
+    #[serde(default, alias = "total_bytes")]
+    pub payload_bytes: u64,
+    /// Total wire-level body bytes consumed across all responses.
+    ///
+    /// For fixed-length responses this matches `payload_bytes`. For chunked
+    /// responses it includes framing and trailers.
+    #[serde(default)]
+    pub wire_bytes: u64,
 }
 
 impl RawWorkerMetrics {
@@ -100,7 +107,8 @@ impl RawWorkerMetrics {
             status_codes: self.status_codes_as_map(),
             latency: self.latency_uncorrected,
             duration_secs: self.duration_secs,
-            total_bytes: self.total_bytes,
+            payload_bytes: self.payload_bytes,
+            wire_bytes: self.wire_bytes,
         }
     }
 }
@@ -387,9 +395,12 @@ pub struct WorkerMetrics {
     pub latency: HdrLatencyHistogram,
     /// Actual test duration in seconds
     pub duration_secs: f64,
-    /// Total bytes received in response bodies
+    /// Total decoded payload bytes received in response bodies.
+    #[serde(default, alias = "total_bytes")]
+    pub payload_bytes: u64,
+    /// Total wire-level body bytes consumed.
     #[serde(default)]
-    pub total_bytes: u64,
+    pub wire_bytes: u64,
 }
 
 impl Default for WorkerMetrics {
@@ -402,7 +413,8 @@ impl Default for WorkerMetrics {
             status_codes: HashMap::new(),
             latency: HdrLatencyHistogram::default(),
             duration_secs: 0.0,
-            total_bytes: 0,
+            payload_bytes: 0,
+            wire_bytes: 0,
         }
     }
 }
@@ -444,12 +456,18 @@ pub struct MergedMetrics {
     pub duration_secs: f64,
     /// Number of workers that reported
     pub worker_count: u32,
-    /// Total bytes transferred (received)
+    /// Total decoded payload bytes received.
+    #[serde(default, alias = "total_bytes")]
+    pub payload_bytes: u64,
+    /// Total wire-level body bytes consumed.
     #[serde(default)]
-    pub total_bytes: u64,
-    /// Transfer rate in bytes per second
+    pub wire_bytes: u64,
+    /// Payload transfer rate in bytes per second.
+    #[serde(default, alias = "transfer_per_sec")]
+    pub payload_transfer_per_sec: f64,
+    /// Wire transfer rate in bytes per second.
     #[serde(default)]
-    pub transfer_per_sec: f64,
+    pub wire_transfer_per_sec: f64,
     /// Full merged latency histogram for export
     #[serde(default)]
     pub latency_histogram: HdrLatencyHistogram,
@@ -468,13 +486,15 @@ impl MergedMetrics {
         let mut success_count: u64 = 0;
         let mut error_count: u64 = 0;
         let mut max_duration: f64 = 0.0;
-        let mut total_bytes: u64 = 0;
+        let mut payload_bytes: u64 = 0;
+        let mut wire_bytes: u64 = 0;
 
         for w in workers {
             total_requests += w.request_count;
             success_count += w.success_count;
             error_count += w.error_count;
-            total_bytes += w.total_bytes;
+            payload_bytes += w.payload_bytes;
+            wire_bytes += w.wire_bytes;
             merged_latency.merge(&w.latency);
             max_duration = max_duration.max(w.duration_secs);
 
@@ -489,8 +509,14 @@ impl MergedMetrics {
             0.0
         };
 
-        let transfer_per_sec = if max_duration > 0.0 {
-            total_bytes as f64 / max_duration
+        let payload_transfer_per_sec = if max_duration > 0.0 {
+            payload_bytes as f64 / max_duration
+        } else {
+            0.0
+        };
+
+        let wire_transfer_per_sec = if max_duration > 0.0 {
+            wire_bytes as f64 / max_duration
         } else {
             0.0
         };
@@ -513,8 +539,10 @@ impl MergedMetrics {
             latency_p9999_ms: round2(merged_latency.percentile_ms(99.99)),
             duration_secs: round2(max_duration),
             worker_count: workers.len() as u32,
-            total_bytes,
-            transfer_per_sec,
+            payload_bytes,
+            wire_bytes,
+            payload_transfer_per_sec,
+            wire_transfer_per_sec,
             latency_histogram: merged_latency,
         }
     }
@@ -544,8 +572,10 @@ impl Default for MergedMetrics {
             latency_p9999_ms: 0.0,
             duration_secs: 0.0,
             worker_count: 0,
-            total_bytes: 0,
-            transfer_per_sec: 0.0,
+            payload_bytes: 0,
+            wire_bytes: 0,
+            payload_transfer_per_sec: 0.0,
+            wire_transfer_per_sec: 0.0,
             latency_histogram: HdrLatencyHistogram::default(),
         }
     }
@@ -737,6 +767,8 @@ mod tests {
             success_count: 95,
             error_count: 5,
             duration_secs: 10.0,
+            payload_bytes: 2_000,
+            wire_bytes: 2_200,
             ..WorkerMetrics::default()
         };
         w1.latency.record(5_000);
@@ -748,6 +780,8 @@ mod tests {
             success_count: 100,
             error_count: 0,
             duration_secs: 10.0,
+            payload_bytes: 3_000,
+            wire_bytes: 3_300,
             ..WorkerMetrics::default()
         };
         w2.latency.record(3_000);
@@ -761,6 +795,10 @@ mod tests {
         assert_eq!(merged.worker_count, 2);
         assert_eq!(merged.rps, 20.0);
         assert_eq!(merged.rpm, 1200.0);
+        assert_eq!(merged.payload_bytes, 5_000);
+        assert_eq!(merged.wire_bytes, 5_500);
+        assert_eq!(merged.payload_transfer_per_sec, 500.0);
+        assert_eq!(merged.wire_transfer_per_sec, 550.0);
     }
 
     #[test]
@@ -789,6 +827,8 @@ mod tests {
             request_count: 1000,
             success_count: 1000,
             duration_secs: 5.0,
+            payload_bytes: 4_000,
+            wire_bytes: 4_400,
             ..WorkerMetrics::default()
         };
         for i in 1..=1000 {
@@ -806,6 +846,40 @@ mod tests {
         );
         assert_eq!(original.total_requests, restored.total_requests);
         assert_eq!(original.latency_p99_ms, restored.latency_p99_ms);
+        assert_eq!(original.payload_bytes, restored.payload_bytes);
+        assert_eq!(original.wire_bytes, restored.wire_bytes);
+    }
+
+    #[test]
+    fn test_merged_metrics_deserializes_legacy_total_bytes_fields() {
+        let json = serde_json::json!({
+            "total_requests": 10,
+            "successful_requests": 10,
+            "failed_requests": 0,
+            "status_codes": {},
+            "rpm": 600.0,
+            "rps": 10.0,
+            "latency_avg_ms": 1.0,
+            "latency_min_ms": 1.0,
+            "latency_max_ms": 1.0,
+            "latency_p50_ms": 1.0,
+            "latency_p90_ms": 1.0,
+            "latency_p95_ms": 1.0,
+            "latency_p99_ms": 1.0,
+            "latency_p999_ms": 1.0,
+            "latency_p9999_ms": 1.0,
+            "duration_secs": 1.0,
+            "worker_count": 1,
+            "total_bytes": 1234,
+            "transfer_per_sec": 1234.0,
+            "latency_histogram": HdrLatencyHistogram::default().to_base64()
+        });
+
+        let restored: MergedMetrics = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.payload_bytes, 1234);
+        assert_eq!(restored.payload_transfer_per_sec, 1234.0);
+        assert_eq!(restored.wire_bytes, 0);
+        assert_eq!(restored.wire_transfer_per_sec, 0.0);
     }
 
     #[test]

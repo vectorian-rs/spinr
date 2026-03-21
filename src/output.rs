@@ -28,8 +28,12 @@ pub fn print_metrics(metrics: &MergedMetrics) {
     println!();
     println!("  Actual RPS:        {:.2}", metrics.rps);
     println!(
-        "  Transfer/sec:      {}",
-        format_bytes(metrics.transfer_per_sec)
+        "  Payload/sec:       {}",
+        format_bytes(metrics.payload_transfer_per_sec)
+    );
+    println!(
+        "  Wire/sec:          {}",
+        format_bytes(metrics.wire_transfer_per_sec)
     );
     println!("  Actual RPM:        {:.2}", metrics.rpm);
     println!();

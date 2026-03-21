@@ -4,11 +4,12 @@
 //! sequentially as a load test, and prints a summary table at the end.
 
 use crate::loadtest::orchestrator::OrchestratorError;
+use crate::loadtest::plan::{
+    ConnectionCount, LoadPlan, LoadPlanMode, RequestsPerSecond, WorkerCount,
+};
 use crate::loadtest::preflight::PreflightError;
 use crate::loadtest::request::BuildRequestError;
-use crate::loadtest::types::{
-    EngineConfig, EngineMode, HttpMethod, MergedMetrics, RawWorkerMetrics,
-};
+use crate::loadtest::types::{HttpMethod, MergedMetrics, RawWorkerMetrics};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -258,49 +259,34 @@ pub fn run_single_loadtest(
                 host: authority.clone(),
             })?;
 
-    let worker_count = params
-        .threads
-        .unwrap_or_else(|| num_cpus::get() as u32)
-        .max(1);
-
-    let mode = if params.max_throughput {
-        EngineMode::MaxThroughput
+    let worker_count = params.threads.unwrap_or_else(|| num_cpus::get() as u32);
+    let plan_mode = if params.max_throughput {
+        LoadPlanMode::MaxThroughput
     } else {
-        EngineMode::RateLimited {
-            requests_per_second: params.rate as u64,
+        LoadPlanMode::RateLimited {
+            total_requests_per_second: RequestsPerSecond::new(params.rate as u64),
             latency_correction: true,
         }
     };
+    let plan = LoadPlan::build(
+        WorkerCount::new(worker_count),
+        ConnectionCount::new(params.connections),
+        plan_mode,
+    );
 
-    let total_connections = if params.max_throughput {
-        params.connections.max(worker_count)
-    } else {
-        params.connections.max(1)
-    };
+    crate::loadtest::preflight::run_preflight(
+        plan.total_connections().get(),
+        plan.worker_count().get(),
+        json,
+    )?;
 
-    crate::loadtest::preflight::run_preflight(total_connections, worker_count, json)?;
-
-    let mut configs = Vec::with_capacity(worker_count as usize);
-    for worker_id in 0..worker_count {
-        let base = total_connections / worker_count;
-        let extra = if worker_id < (total_connections % worker_count) {
-            1
-        } else {
-            0
-        };
-        let conns = (base + extra).max(1);
-
-        configs.push(EngineConfig {
-            worker_id,
-            remote_addr,
-            method: params.method,
-            connections: conns,
-            duration_seconds: params.duration,
-            warmup_seconds: params.warmup,
-            mode: mode.clone(),
-            read_buffer_size: 8192,
-        });
-    }
+    let configs = plan.engine_configs(
+        remote_addr,
+        params.method,
+        params.duration,
+        params.warmup,
+        8192,
+    );
 
     macro_rules! out {
         ($($arg:tt)*) => {
@@ -316,8 +302,8 @@ pub fn run_single_loadtest(
     out!("  URL:         {}", params.url);
     out!("  Method:      {}", params.method);
     out!("  Target:      {}", remote_addr);
-    out!("  Connections: {}", total_connections);
-    out!("  Workers:     {}", worker_count);
+    out!("  Connections: {}", plan.total_connections().get());
+    out!("  Workers:     {}", plan.worker_count().get());
     if params.warmup > 0 {
         out!("  Warmup:      {}s", params.warmup);
     }

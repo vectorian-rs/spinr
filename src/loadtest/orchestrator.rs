@@ -205,7 +205,8 @@ mod tests {
             latency_uncorrected: HdrLatencyHistogram::default(),
             latency_corrected: None,
             duration_secs: 10.0,
-            total_bytes: 0,
+            payload_bytes: 0,
+            wire_bytes: 0,
         };
 
         let map = raw.status_codes_as_map();
@@ -233,7 +234,8 @@ mod tests {
             latency_uncorrected: HdrLatencyHistogram::default(),
             latency_corrected: None,
             duration_secs: 5.0,
-            total_bytes: 12345,
+            payload_bytes: 12345,
+            wire_bytes: 12500,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -244,6 +246,7 @@ mod tests {
         assert_eq!(restored.status_counts[200], 100);
         assert_eq!(restored.status_counts[503], 3);
         assert_eq!(restored.status_counts[404], 0);
-        assert_eq!(restored.total_bytes, 12345);
+        assert_eq!(restored.payload_bytes, 12345);
+        assert_eq!(restored.wire_bytes, 12500);
     }
 }
