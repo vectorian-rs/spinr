@@ -1,5 +1,5 @@
 [env]
-SPINR_VERSION = "0.5.0"
+SPINR_VERSION = "0.5.1"
 
 [tasks."docker:prod-arm64"]
 description = "Build prod ARM64 Docker image"
