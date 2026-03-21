@@ -462,12 +462,35 @@ fn handle_readable(
                                         return Ok(());
                                     }
                                     BodyKind::Chunked => {
-                                        return handle_connection_failure(
-                                            poll,
-                                            connection,
-                                            metrics,
-                                            allow_reconnect,
-                                        );
+                                        // Check if the terminal chunk marker is already
+                                        // in the buffer (body portion after headers).
+                                        let body_start = parsed.header_len;
+                                        let buffered =
+                                            &connection.read_buf[body_start..connection.read_len];
+                                        if chunked_body_complete(buffered) {
+                                            if measure_request {
+                                                metrics.record_response(
+                                                    Some(status_code),
+                                                    request_start,
+                                                    scheduled_start,
+                                                    body_bytes_in_buffer,
+                                                    false,
+                                                );
+                                            }
+                                            connection.finish_response(
+                                                poll,
+                                                should_close,
+                                                allow_reconnect,
+                                            )?;
+                                            return Ok(());
+                                        }
+                                        connection.state = ConnectionState::DrainingChunked {
+                                            status_code,
+                                            should_close,
+                                        };
+                                        connection.read_len = 0;
+                                        connection.reregister(poll, Interest::READABLE)?;
+                                        return Ok(());
                                     }
                                 }
                             }
@@ -536,6 +559,56 @@ fn handle_readable(
                             total_body_len,
                             should_close,
                         };
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        return handle_connection_failure(
+                            poll,
+                            connection,
+                            metrics,
+                            allow_reconnect,
+                        );
+                    }
+                }
+            }
+        }
+        ConnectionState::DrainingChunked {
+            status_code,
+            should_close,
+        } => {
+            let Some(stream) = connection.stream.as_mut() else {
+                return Ok(());
+            };
+
+            loop {
+                match stream.read(&mut connection.read_buf[..]) {
+                    Ok(0) => {
+                        return handle_connection_failure(
+                            poll,
+                            connection,
+                            metrics,
+                            allow_reconnect,
+                        );
+                    }
+                    Ok(read) => {
+                        // We only need to detect the terminal chunk marker.
+                        // Scan the freshly-read bytes (plus a small overlap to
+                        // catch a marker that spans two reads).
+                        if chunked_body_complete(&connection.read_buf[..read]) {
+                            if connection.measure_request {
+                                metrics.record_response(
+                                    Some(status_code),
+                                    connection.request_start.unwrap_or_else(Instant::now),
+                                    connection.scheduled_start,
+                                    0,
+                                    false,
+                                );
+                            }
+                            connection.finish_response(poll, should_close, allow_reconnect)?;
+                            return Ok(());
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         return Ok(());
                     }
                     Err(_) => {
@@ -624,6 +697,11 @@ fn parse_response_head(buf: &[u8], expects_body: bool) -> io::Result<Option<Pars
     }
 }
 
+/// Check if a buffer contains the chunked transfer-encoding terminal marker `0\r\n\r\n`.
+fn chunked_body_complete(buf: &[u8]) -> bool {
+    buf.windows(5).any(|w| w == b"0\r\n\r\n")
+}
+
 fn invalid_response(err: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
@@ -655,6 +733,10 @@ enum ConnectionState {
         remaining: u64,
         status_code: u16,
         total_body_len: u64,
+        should_close: bool,
+    },
+    DrainingChunked {
+        status_code: u16,
         should_close: bool,
     },
     Closed,
@@ -725,9 +807,9 @@ impl Connection {
     fn interest(&self, mode: &EngineMode, now: Instant, allow_reconnect: bool) -> Interest {
         match self.state {
             ConnectionState::Connecting | ConnectionState::Writing => Interest::WRITABLE,
-            ConnectionState::ReadingHead | ConnectionState::DrainingContentLength { .. } => {
-                Interest::READABLE
-            }
+            ConnectionState::ReadingHead
+            | ConnectionState::DrainingContentLength { .. }
+            | ConnectionState::DrainingChunked { .. } => Interest::READABLE,
             ConnectionState::Idle if !allow_reconnect => Interest::READABLE,
             ConnectionState::Idle => match mode {
                 EngineMode::MaxThroughput => Interest::WRITABLE,
@@ -906,7 +988,6 @@ mod tests {
             warmup_seconds: 0,
             mode: EngineMode::MaxThroughput,
             read_buffer_size: 4096,
-            verify_body: false,
         };
 
         let metrics = run_for_durations(
@@ -926,6 +1007,92 @@ mod tests {
         assert!(metrics.status_counts[200] > 0);
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn parses_chunked_response() {
+        let parsed = parse_response_head(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parsed.status_code, 200);
+        assert_eq!(parsed.body_kind, BodyKind::Chunked);
+    }
+
+    #[test]
+    fn chunked_body_complete_detects_terminal_marker() {
+        assert!(chunked_body_complete(b"4\r\ndata\r\n0\r\n\r\n"));
+        assert!(!chunked_body_complete(b"4\r\ndata\r\n"));
+        assert!(chunked_body_complete(b"0\r\n\r\n"));
+    }
+
+    #[test]
+    fn runs_against_chunked_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(2) {
+                thread::spawn(move || handle_chunked_client(stream));
+            }
+        });
+
+        let request_bytes = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+        let config = EngineConfig {
+            worker_id: 0,
+            remote_addr: addr,
+            method: crate::loadtest::types::HttpMethod::GET,
+            connections: 2,
+            duration_seconds: 0,
+            warmup_seconds: 0,
+            mode: EngineMode::MaxThroughput,
+            read_buffer_size: 4096,
+        };
+
+        let metrics = run_for_durations(
+            &config,
+            request_bytes,
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(
+            metrics.request_count > 0,
+            "expected at least one completed request against chunked server"
+        );
+        assert_eq!(
+            metrics.error_count, 0,
+            "chunked responses should not be errors"
+        );
+        assert!(metrics.status_counts[200] > 0);
+
+        server.join().unwrap();
+    }
+
+    fn handle_chunked_client(mut stream: std::net::TcpStream) {
+        let mut buf = [0u8; 4096];
+        loop {
+            let read = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+
+            if !buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                continue;
+            }
+
+            let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+            if stream.write_all(response).is_err() {
+                break;
+            }
+        }
+
+        let _ = stream.shutdown(Shutdown::Both);
     }
 
     fn handle_keep_alive_client(mut stream: std::net::TcpStream) {

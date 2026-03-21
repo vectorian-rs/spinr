@@ -73,40 +73,48 @@ pub fn run(mode: ToolMode) -> Result<(), McpStdioError> {
             Ok(request) => runtime.block_on(handle_request(&state, mode, request)),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to parse JSON-RPC request");
-                JsonRpcResponse::parse_error(format!("Parse error: {}", e))
+                Some(JsonRpcResponse::parse_error(format!("Parse error: {}", e)))
             }
         };
 
-        let output = serde_json::to_string(&response)?;
-        writeln!(stdout, "{}", output)?;
-        stdout.flush()?;
+        if let Some(response) = response {
+            let output = serde_json::to_string(&response)?;
+            writeln!(stdout, "{}", output)?;
+            stdout.flush()?;
+        }
     }
 
     Ok(())
 }
 
-/// Handle a single JSON-RPC request
+/// Handle a single JSON-RPC request.
+///
+/// Returns `None` for JSON-RPC notifications (requests without an `id`),
+/// which must not receive a response per the spec.
 async fn handle_request(
     state: &Arc<ServerState>,
     mode: ToolMode,
     request: JsonRpcRequest,
-) -> JsonRpcResponse {
+) -> Option<JsonRpcResponse> {
     tracing::info!(method = %request.method, id = ?request.id, "Processing request");
 
-    match request.method.as_str() {
-        "initialize" => handle_initialize(request.id),
-        "notifications/initialized" => {
-            if request.id.is_some() {
-                JsonRpcResponse::success(request.id, json!({}))
-            } else {
-                JsonRpcResponse::success(None, json!({}))
-            }
+    // JSON-RPC notifications (no id) must not receive a response
+    if request.method.starts_with("notifications/") {
+        if let Some(id) = request.id {
+            // Has an id — treat as a regular request, respond with success
+            return Some(JsonRpcResponse::success(Some(id), json!({})));
         }
+        tracing::debug!(method = %request.method, "Notification received, no response sent");
+        return None;
+    }
+
+    Some(match request.method.as_str() {
+        "initialize" => handle_initialize(request.id),
         "tools/list" => handle_tools_list(mode, request.id),
         "tools/call" => handle_tools_call(state, mode, request.id, request.params).await,
         "ping" => JsonRpcResponse::success(request.id, json!({})),
         _ => JsonRpcResponse::method_not_found(request.id),
-    }
+    })
 }
 
 /// Handle initialize request
@@ -170,7 +178,7 @@ async fn handle_tools_call(
 
 // ── Trace tool ──
 
-fn trace_tool_definition() -> McpTool {
+pub(crate) fn trace_tool_definition() -> McpTool {
     McpTool::new(
         "trace_request",
         "Trace an HTTP request with detailed timing breakdown for each phase: DNS lookup, TCP connect, TLS handshake, time to first byte, and content transfer.",
@@ -245,7 +253,7 @@ async fn handle_trace_request(id: Option<Value>, arguments: Value) -> JsonRpcRes
 
 // ── Load test tools ──
 
-fn loadtest_tool_definitions() -> Vec<McpTool> {
+pub(crate) fn loadtest_tool_definitions() -> Vec<McpTool> {
     vec![
         McpTool::new(
             "start_load_test",
@@ -306,7 +314,10 @@ fn loadtest_tool_definitions() -> Vec<McpTool> {
     ]
 }
 
-fn handle_start_load_test(state: &Arc<ServerState>, args: Value) -> Result<String, String> {
+pub(crate) fn handle_start_load_test(
+    state: &Arc<ServerState>,
+    args: Value,
+) -> Result<String, String> {
     // Check if a test is already running
     {
         let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
@@ -389,7 +400,7 @@ fn handle_start_load_test(state: &Arc<ServerState>, args: Value) -> Result<Strin
     Ok(serde_json::to_string_pretty(&response).unwrap())
 }
 
-fn handle_stop_load_test(state: &Arc<ServerState>) -> Result<String, String> {
+pub(crate) fn handle_stop_load_test(state: &Arc<ServerState>) -> Result<String, String> {
     let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
 
     match *handle {
@@ -405,7 +416,7 @@ fn handle_stop_load_test(state: &Arc<ServerState>) -> Result<String, String> {
     }
 }
 
-fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
+pub(crate) fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
     // Check if the thread has finished and update status accordingly
     {
         let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
@@ -423,7 +434,7 @@ fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
 
 // ── Helpers ──
 
-fn tool_error(id: Option<Value>, message: &str) -> JsonRpcResponse {
+pub(crate) fn tool_error(id: Option<Value>, message: &str) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
         json!({
@@ -436,7 +447,7 @@ fn tool_error(id: Option<Value>, message: &str) -> JsonRpcResponse {
     )
 }
 
-fn wrap_result(id: Option<Value>, result: Result<String, String>) -> JsonRpcResponse {
+pub(crate) fn wrap_result(id: Option<Value>, result: Result<String, String>) -> JsonRpcResponse {
     match result {
         Ok(content) => JsonRpcResponse::success(
             id,

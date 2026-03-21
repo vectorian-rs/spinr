@@ -7,7 +7,7 @@ use crate::trace::types::{
 };
 use hickory_resolver::TokioResolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Either, Empty, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use rustls_pki_types::ServerName;
@@ -300,26 +300,32 @@ async fn trace_http2(
     let authority = host.to_string();
     let uri = format!("https://{}{}", host, path);
 
-    let req_body: Empty<Bytes> = Empty::new();
-    let mut request = hyper::Request::builder()
+    let mut request_builder = hyper::Request::builder()
         .method(method)
         .uri(&uri)
         .header("host", &authority)
         .header("user-agent", "spinr/0.1");
 
     for (key, value) in headers {
-        request = request.header(key.as_str(), value.as_str());
+        request_builder = request_builder.header(key.as_str(), value.as_str());
     }
 
-    // Note: HTTP/2 body support would require a different body type (e.g., Full<Bytes>)
-    let _ = body;
-    let request = request.body(req_body).map_err(TraceError::BuildRequest)?;
+    let body_len = body.map(|b| b.len()).unwrap_or(0);
+    let req_body: Either<Full<Bytes>, Empty<Bytes>> = if let Some(body_content) = body {
+        Either::Left(Full::new(Bytes::from(body_content.to_string())))
+    } else {
+        Either::Right(Empty::new())
+    };
+    let request = request_builder
+        .body(req_body)
+        .map_err(TraceError::BuildRequest)?;
 
     let request_size = uri.len()
         + headers
             .iter()
             .map(|(k, v)| k.len() + v.len() + 4)
             .sum::<usize>()
+        + body_len
         + 50; // Approximate
 
     // Perform HTTP/2 handshake and send request

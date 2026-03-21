@@ -84,8 +84,6 @@ pub struct ScenarioConfig {
     #[serde(default)]
     pub threads: Option<u32>,
     #[serde(default)]
-    pub verify_body: bool,
-    #[serde(default)]
     pub hdr_log: Option<String>,
 }
 
@@ -159,7 +157,6 @@ pub struct LoadTestParams {
     pub max_throughput: bool,
     pub rate: u32,
     pub threads: Option<u32>,
-    pub verify_body: bool,
     pub hdr_log: Option<String>,
 }
 
@@ -177,7 +174,6 @@ impl LoadTestParams {
             max_throughput: s.max_throughput,
             rate: s.rate,
             threads: s.threads,
-            verify_body: s.verify_body,
             hdr_log: s.hdr_log.clone(),
         })
     }
@@ -203,7 +199,6 @@ impl LoadTestParams {
             max_throughput: cmd.max_throughput,
             rate: cmd.rate,
             threads: cmd.threads,
-            verify_body: cmd.verify_body,
             hdr_log: cmd.hdr_log.clone(),
         })
     }
@@ -297,7 +292,6 @@ pub fn run_single_loadtest(
             warmup_seconds: params.warmup,
             mode: mode.clone(),
             read_buffer_size: 8192,
-            verify_body: params.verify_body,
         });
     }
 
@@ -482,7 +476,6 @@ duration = 60
 warmup = 5
 max_throughput = true
 rate = 5000
-verify_body = true
 hdr_log = "/tmp/test.hlog"
 body = '{"key": "value"}'
 
@@ -499,7 +492,6 @@ Authorization = "Bearer tok123"
         assert_eq!(s.warmup, 5);
         assert!(s.max_throughput);
         assert_eq!(s.rate, 5000);
-        assert!(s.verify_body);
         assert_eq!(s.hdr_log.as_deref(), Some("/tmp/test.hlog"));
         assert_eq!(s.body.as_deref(), Some(r#"{"key": "value"}"#));
         assert_eq!(s.headers.get("Content-Type").unwrap(), "application/json");
@@ -621,7 +613,6 @@ max_throughput = true
             headers: HashMap::from([("X-Key".to_string(), "val".to_string())]),
             body: Some("payload".to_string()),
             threads: Some(4),
-            verify_body: true,
             hdr_log: Some("/tmp/h.hlog".to_string()),
         };
         let params = LoadTestParams::from_scenario(&scenario).unwrap();
@@ -631,7 +622,6 @@ max_throughput = true
         assert_eq!(params.warmup, 5);
         assert_eq!(params.rate, 1000);
         assert!(!params.max_throughput);
-        assert!(params.verify_body);
         assert_eq!(params.headers.get("X-Key").unwrap(), "val");
         assert_eq!(params.body.as_deref(), Some("payload"));
         assert_eq!(params.threads, Some(4));

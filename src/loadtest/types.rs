@@ -42,8 +42,6 @@ pub struct EngineConfig {
     pub mode: EngineMode,
     /// Per-connection read buffer size in bytes
     pub read_buffer_size: usize,
-    /// Whether to read and verify response bodies
-    pub verify_body: bool,
 }
 
 /// Raw metrics returned by a single engine worker process.
@@ -262,7 +260,6 @@ impl StartLoadTestArgs {
             max_throughput: false,
             rate: self.total_rate,
             threads: self.process_count,
-            verify_body: false,
             hdr_log: None,
         })
     }

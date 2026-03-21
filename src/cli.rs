@@ -148,10 +148,6 @@ pub struct LoadTestCommand {
     #[argh(switch)]
     pub mcp: bool,
 
-    /// read and verify response bodies (default: status-code-only + drain)
-    #[argh(switch)]
-    pub verify_body: bool,
-
     /// MCP transport: "stdio" or "http" (default: stdio)
     #[argh(option, default = "String::from(\"stdio\")")]
     pub transport_type: String,

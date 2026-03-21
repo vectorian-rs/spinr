@@ -139,6 +139,9 @@ async fn run_trace_cli(cmd: TraceCommand) -> Result<(), Box<dyn std::error::Erro
         }
     };
 
+    let multi_json = cmd.json && cmd.url.len() > 1;
+    let mut json_results: Vec<serde_json::Value> = Vec::new();
+
     for url in &cmd.url {
         let args = trace::types::TraceRequestArgs {
             url: url.clone(),
@@ -151,7 +154,9 @@ async fn run_trace_cli(cmd: TraceCommand) -> Result<(), Box<dyn std::error::Erro
 
         match trace::tracer::trace_request(&args).await {
             Ok(result) => {
-                if cmd.json {
+                if multi_json {
+                    json_results.push(serde_json::to_value(&result)?);
+                } else if cmd.json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
                     println!("URL:            {}", result.url);
@@ -180,6 +185,10 @@ async fn run_trace_cli(cmd: TraceCommand) -> Result<(), Box<dyn std::error::Erro
                 eprintln!("Error tracing {}: {}", url, e);
             }
         }
+    }
+
+    if multi_json {
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
     }
 
     Ok(())
@@ -231,7 +240,6 @@ async fn run_mcp_server(
 #[derive(Clone)]
 struct SpinrHttpHandler {
     mode: ToolMode,
-    #[allow(dead_code)]
     state: std::sync::Arc<mcp::stdio::ServerState>,
 }
 
@@ -257,43 +265,11 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
         let mut tools = Vec::new();
 
         if matches!(self.mode, ToolMode::TraceOnly | ToolMode::All) {
-            tools.push(mcp::McpTool::new(
-                "trace_request",
-                "Trace an HTTP request with detailed timing breakdown",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "url": { "type": "string", "description": "URL to request" }
-                    },
-                    "required": ["url"]
-                }),
-            ));
+            tools.push(mcp::stdio::trace_tool_definition());
         }
 
         if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) {
-            tools.push(mcp::McpTool::new(
-                "start_load_test",
-                "Start a new HTTP load test",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "target_url": { "type": "string" },
-                        "total_rate": { "type": "integer" },
-                        "duration_seconds": { "type": "integer" }
-                    },
-                    "required": ["target_url", "total_rate", "duration_seconds"]
-                }),
-            ));
-            tools.push(mcp::McpTool::new(
-                "stop_load_test",
-                "Stop the currently running load test",
-                serde_json::json!({ "type": "object", "properties": {} }),
-            ));
-            tools.push(mcp::McpTool::new(
-                "get_status",
-                "Get the status of the current or last load test",
-                serde_json::json!({ "type": "object", "properties": {} }),
-            ));
+            tools.extend(mcp::stdio::loadtest_tool_definitions());
         }
 
         mcp::JsonRpcResponse::success(None, serde_json::json!({ "tools": tools }))
@@ -321,12 +297,9 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
                     let args: trace::TraceRequestArgs = match serde_json::from_value(arguments) {
                         Ok(a) => a,
                         Err(e) => {
-                            return mcp::JsonRpcResponse::success(
+                            return mcp::stdio::tool_error(
                                 id,
-                                serde_json::json!({
-                                    "content": [{"type": "text", "text": format!("Error: Invalid arguments: {}", e)}],
-                                    "isError": true
-                                }),
+                                &format!("Invalid arguments: {}", e),
                             );
                         }
                     };
@@ -337,22 +310,24 @@ impl mcp::transport::McpHttpHandler for SpinrHttpHandler {
                                 "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}]
                             }),
                         ),
-                        Err(e) => mcp::JsonRpcResponse::success(
-                            id,
-                            serde_json::json!({
-                                "content": [{"type": "text", "text": format!("Error: {}", e)}],
-                                "isError": true
-                            }),
-                        ),
+                        Err(e) => mcp::stdio::tool_error(id, &e.to_string()),
                     }
                 }
-                _ => mcp::JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": format!("Error: Unknown tool: {}", tool_name)}],
-                        "isError": true
-                    }),
-                ),
+                "start_load_test"
+                    if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) =>
+                {
+                    mcp::stdio::wrap_result(
+                        id,
+                        mcp::stdio::handle_start_load_test(&self.state, arguments),
+                    )
+                }
+                "stop_load_test" if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) => {
+                    mcp::stdio::wrap_result(id, mcp::stdio::handle_stop_load_test(&self.state))
+                }
+                "get_status" if matches!(self.mode, ToolMode::LoadTestOnly | ToolMode::All) => {
+                    mcp::stdio::wrap_result(id, mcp::stdio::handle_get_status(&self.state))
+                }
+                _ => mcp::stdio::tool_error(id, &format!("Unknown tool: {}", tool_name)),
             }
         })
     }
