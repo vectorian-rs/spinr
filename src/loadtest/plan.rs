@@ -155,7 +155,6 @@ impl LoadPlan {
         WorkerCount::new(self.workers.len() as u32)
     }
 
-    #[allow(dead_code)]
     pub fn workers(&self) -> &[WorkerPlan] {
         &self.workers
     }

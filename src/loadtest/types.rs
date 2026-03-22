@@ -74,7 +74,7 @@ pub struct RawWorkerMetrics {
     /// Actual measurement duration in seconds
     pub duration_secs: f64,
     /// Total decoded payload bytes received across all responses.
-    #[serde(default, alias = "total_bytes")]
+    #[serde(default)]
     pub payload_bytes: u64,
     /// Total wire-level body bytes consumed across all responses.
     ///
@@ -409,7 +409,7 @@ pub struct WorkerMetrics {
     /// Actual test duration in seconds
     pub duration_secs: f64,
     /// Total decoded payload bytes received in response bodies.
-    #[serde(default, alias = "total_bytes")]
+    #[serde(default)]
     pub payload_bytes: u64,
     /// Total wire-level body bytes consumed.
     #[serde(default)]
@@ -470,13 +470,13 @@ pub struct MergedMetrics {
     /// Number of workers that reported
     pub worker_count: u32,
     /// Total decoded payload bytes received.
-    #[serde(default, alias = "total_bytes")]
+    #[serde(default)]
     pub payload_bytes: u64,
     /// Total wire-level body bytes consumed.
     #[serde(default)]
     pub wire_bytes: u64,
     /// Payload transfer rate in bytes per second.
-    #[serde(default, alias = "transfer_per_sec")]
+    #[serde(default)]
     pub payload_transfer_per_sec: f64,
     /// Wire transfer rate in bytes per second.
     #[serde(default)]
@@ -917,38 +917,6 @@ mod tests {
         assert_eq!(original.latency_p99_ms, restored.latency_p99_ms);
         assert_eq!(original.payload_bytes, restored.payload_bytes);
         assert_eq!(original.wire_bytes, restored.wire_bytes);
-    }
-
-    #[test]
-    fn test_merged_metrics_deserializes_legacy_total_bytes_fields() {
-        let json = serde_json::json!({
-            "total_requests": 10,
-            "successful_requests": 10,
-            "failed_requests": 0,
-            "status_codes": {},
-            "rpm": 600.0,
-            "rps": 10.0,
-            "latency_avg_ms": 1.0,
-            "latency_min_ms": 1.0,
-            "latency_max_ms": 1.0,
-            "latency_p50_ms": 1.0,
-            "latency_p90_ms": 1.0,
-            "latency_p95_ms": 1.0,
-            "latency_p99_ms": 1.0,
-            "latency_p999_ms": 1.0,
-            "latency_p9999_ms": 1.0,
-            "duration_secs": 1.0,
-            "worker_count": 1,
-            "total_bytes": 1234,
-            "transfer_per_sec": 1234.0,
-            "latency_histogram": HdrLatencyHistogram::default().to_base64()
-        });
-
-        let restored: MergedMetrics = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.payload_bytes, 1234);
-        assert_eq!(restored.payload_transfer_per_sec, 1234.0);
-        assert_eq!(restored.wire_bytes, 0);
-        assert_eq!(restored.wire_transfer_per_sec, 0.0);
     }
 
     #[test]

@@ -302,7 +302,14 @@ pub fn run_single_loadtest(
     out!("  URL:         {}", params.url);
     out!("  Method:      {}", params.method);
     out!("  Target:      {}", remote_addr);
-    out!("  Connections: {}", plan.total_connections().get());
+    out!(
+        "  Connections: {} ({:?})",
+        plan.total_connections().get(),
+        plan.workers()
+            .iter()
+            .map(|w| w.connections.get())
+            .collect::<Vec<_>>()
+    );
     out!("  Workers:     {}", plan.worker_count().get());
     if params.warmup > 0 {
         out!("  Warmup:      {}s", params.warmup);
