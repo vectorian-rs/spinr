@@ -193,27 +193,31 @@ impl std::str::FromStr for HttpMethod {
     }
 }
 
-/// Current status of a load test
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TestStatus {
-    /// Whether a test is currently running
-    pub running: bool,
+/// Lifecycle phase of a load test.
+///
+/// Replaces the old `TestStatus` struct that used `running: bool` +
+/// `completed: Option<bool>`, which permitted contradictory states.
+/// The enum guarantees exactly one valid phase at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "phase")]
+pub enum TestPhase {
+    Idle,
+    Running {
+        start_time: String,
+    },
+    Finished {
+        start_time: String,
+        end_time: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics: Option<MergedMetrics>,
+    },
+}
 
-    /// Whether the test completed naturally
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed: Option<bool>,
-
-    /// When the test started (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_time: Option<String>,
-
-    /// When the test ended (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_time: Option<String>,
-
-    /// Merged metrics from all workers (populated after completion)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<MergedMetrics>,
+impl Default for TestPhase {
+    fn default() -> Self {
+        Self::Idle
+    }
 }
 
 /// Arguments for start_load_test tool

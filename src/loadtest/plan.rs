@@ -202,6 +202,86 @@ fn distribute_u64(total: u64, slots: u32) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn proof_distribute_u32_sum() {
+        let total: u32 = kani::any();
+        let slots: u32 = kani::any();
+        kani::assume(slots >= 1 && slots <= 64);
+
+        let shares = distribute_u32(total, slots);
+        let sum: u32 = shares.iter().sum();
+        assert!(sum == total, "distribute_u32 sum mismatch");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn proof_distribute_u64_sum() {
+        let total: u64 = kani::any();
+        let slots: u32 = kani::any();
+        kani::assume(slots >= 1 && slots <= 64);
+
+        let shares = distribute_u64(total, slots);
+        let sum: u64 = shares.iter().sum();
+        assert!(sum == total, "distribute_u64 sum mismatch");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn proof_distribute_u32_balanced() {
+        let total: u32 = kani::any();
+        let slots: u32 = kani::any();
+        kani::assume(slots >= 1 && slots <= 64);
+
+        let shares = distribute_u32(total, slots);
+        let min = *shares.iter().min().unwrap();
+        let max = *shares.iter().max().unwrap();
+        assert!(max - min <= 1, "distribute_u32 shares differ by more than 1");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn proof_distribute_u64_balanced() {
+        let total: u64 = kani::any();
+        let slots: u32 = kani::any();
+        kani::assume(slots >= 1 && slots <= 64);
+
+        let shares = distribute_u64(total, slots);
+        let min = *shares.iter().min().unwrap();
+        let max = *shares.iter().max().unwrap();
+        assert!(max - min <= 1, "distribute_u64 shares differ by more than 1");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn proof_loadplan_connection_preservation() {
+        let workers_val: u32 = kani::any();
+        kani::assume(workers_val >= 1 && workers_val <= 8);
+        let conns_val: u32 = kani::any();
+        kani::assume(conns_val >= 1 && conns_val <= 64);
+
+        let plan = LoadPlan::build(
+            WorkerCount::new(workers_val),
+            ConnectionCount::new(conns_val),
+            LoadPlanMode::MaxThroughput,
+        );
+
+        let total: u32 = plan
+            .workers()
+            .iter()
+            .map(|w| w.connections.get())
+            .sum();
+        assert!(
+            total == conns_val,
+            "LoadPlan must preserve total connections"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -684,6 +684,25 @@ struct ParsedResponseHead {
     connection_close: bool,
 }
 
+/// Classify the response body framing from method, status, and headers.
+///
+/// Extracted as a pure function so it can be tested and formally verified
+/// without requiring mio/network state.
+fn classify_body_kind(
+    expects_body: bool,
+    status_code: u16,
+    has_chunked_te: bool,
+    content_length: Option<usize>,
+) -> BodyKind {
+    if !expects_body || matches!(status_code, 100..=199 | 204 | 304) {
+        BodyKind::None
+    } else if has_chunked_te {
+        BodyKind::Chunked
+    } else {
+        BodyKind::Fixed(content_length.unwrap_or(0))
+    }
+}
+
 fn parse_response_head(buf: &[u8], expects_body: bool) -> io::Result<Option<ParsedResponseHead>> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);
@@ -716,13 +735,7 @@ fn parse_response_head(buf: &[u8], expects_body: bool) -> io::Result<Option<Pars
                 }
             }
 
-            let body_kind = if !expects_body || matches!(status_code, 100..=199 | 204 | 304) {
-                BodyKind::None
-            } else if chunked {
-                BodyKind::Chunked
-            } else {
-                BodyKind::Fixed(content_length.unwrap_or(0))
-            };
+            let body_kind = classify_body_kind(expects_body, status_code, chunked, content_length);
 
             Ok(Some(ParsedResponseHead {
                 status_code,
@@ -1119,6 +1132,223 @@ fn schedule_offset(index: u64, rate_rps: u64) -> Duration {
         Duration::ZERO
     } else {
         Duration::from_secs_f64(index as f64 / rate_rps as f64)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    // ── Chunked decoder proofs ──
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_decoder_split_feed() {
+        let len: usize = kani::any();
+        kani::assume(len <= 32);
+        let mut buf = [0u8; 32];
+        for i in 0..len {
+            buf[i] = kani::any();
+        }
+        let split: usize = kani::any();
+        kani::assume(split <= len);
+
+        // One-shot feed
+        let mut dec_one = ChunkedDecoder::new();
+        let p_one = dec_one.feed(&buf[..len]);
+
+        // Two-part feed
+        let mut dec_two = ChunkedDecoder::new();
+        let p_first = dec_two.feed(&buf[..split]);
+        let p_second = if !dec_two.is_done() {
+            dec_two.feed(&buf[split..len])
+        } else {
+            ChunkedProgress::default()
+        };
+
+        assert!(
+            dec_one.is_done() == dec_two.is_done(),
+            "split-feed must reach same completion state"
+        );
+        assert!(
+            p_one.accounting.payload_bytes
+                == p_first.accounting.payload_bytes + p_second.accounting.payload_bytes,
+            "split-feed must produce same payload bytes"
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn proof_decoder_no_early_done() {
+        let len: usize = kani::any();
+        kani::assume(len > 0 && len < 5);
+        let mut buf = [0u8; 4];
+        for i in 0..len {
+            buf[i] = kani::any();
+        }
+
+        let mut dec = ChunkedDecoder::new();
+        dec.feed(&buf[..len]);
+
+        // A valid chunked terminator is at minimum "0\r\n\r\n" = 5 bytes,
+        // so < 5 bytes should never complete.
+        assert!(
+            !dec.is_done(),
+            "decoder must not reach Done with fewer than 5 bytes"
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_decoder_full_consumption() {
+        // Build a well-formed single-chunk body: "{hex_size}\r\n{data}\r\n0\r\n\r\n"
+        let data_len: u8 = kani::any();
+        kani::assume(data_len >= 1 && data_len <= 15);
+
+        let hex_char = if data_len < 10 {
+            b'0' + data_len
+        } else {
+            b'a' + (data_len - 10)
+        };
+
+        let mut buf = [0u8; 32];
+        buf[0] = hex_char;
+        buf[1] = b'\r';
+        buf[2] = b'\n';
+        for i in 0..(data_len as usize) {
+            buf[3 + i] = b'x';
+        }
+        let off = 3 + data_len as usize;
+        buf[off] = b'\r';
+        buf[off + 1] = b'\n';
+        buf[off + 2] = b'0';
+        buf[off + 3] = b'\r';
+        buf[off + 4] = b'\n';
+        buf[off + 5] = b'\r';
+        buf[off + 6] = b'\n';
+        let total_len = off + 7;
+
+        let mut dec = ChunkedDecoder::new();
+        let progress = dec.feed(&buf[..total_len]);
+
+        assert!(dec.is_done(), "well-formed input must complete");
+        assert!(
+            progress.accounting.wire_bytes == total_len as u64,
+            "wire_bytes must equal total input length"
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_decoder_payload_accounting() {
+        let len: usize = kani::any();
+        kani::assume(len <= 32);
+        let mut buf = [0u8; 32];
+        for i in 0..len {
+            buf[i] = kani::any();
+        }
+
+        let mut dec = ChunkedDecoder::new();
+        let progress = dec.feed(&buf[..len]);
+
+        assert!(
+            progress.accounting.payload_bytes <= progress.accounting.wire_bytes,
+            "payload_bytes must never exceed wire_bytes"
+        );
+    }
+
+    #[kani::proof]
+    fn proof_decoder_no_false_done() {
+        // "0\r\n\r\n" embedded inside a 5-byte data chunk must not trigger Done
+        let input: [u8; 18] = *b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
+        //                       ^5 bytes of data: "0\r\n\r\n", then terminator
+
+        let mut dec = ChunkedDecoder::new();
+        // Feed just the data chunk portion
+        let p1 = dec.feed(&input[..10]); // "5\r\n0\r\n\r\n\r\n"
+        assert!(!dec.is_done(), "must not treat embedded 0\\r\\n\\r\\n as terminal");
+        // Feed the real terminator
+        let p2 = dec.feed(&input[10..]);
+        assert!(dec.is_done(), "must finish after real terminator");
+        assert!(
+            p1.accounting.payload_bytes + p2.accounting.payload_bytes == 5,
+            "total payload must be 5"
+        );
+    }
+
+    // ── Response framing proofs ──
+
+    #[kani::proof]
+    fn proof_head_always_bodyless() {
+        let status_code: u16 = kani::any();
+        kani::assume(status_code >= 100 && status_code <= 599);
+        let has_chunked: bool = kani::any();
+        let cl_val: usize = kani::any();
+        kani::assume(cl_val <= 1_000_000);
+        let has_cl: bool = kani::any();
+        let content_length = if has_cl { Some(cl_val) } else { None };
+
+        // expects_body = false simulates HEAD method
+        let kind = classify_body_kind(false, status_code, has_chunked, content_length);
+        assert!(
+            matches!(kind, BodyKind::None),
+            "HEAD must always produce BodyKind::None"
+        );
+    }
+
+    #[kani::proof]
+    fn proof_1xx_204_304_bodyless() {
+        let status_code: u16 = kani::any();
+        kani::assume(
+            (status_code >= 100 && status_code <= 199)
+                || status_code == 204
+                || status_code == 304,
+        );
+        let has_chunked: bool = kani::any();
+        let cl_val: usize = kani::any();
+        kani::assume(cl_val <= 1_000_000);
+        let has_cl: bool = kani::any();
+        let content_length = if has_cl { Some(cl_val) } else { None };
+
+        let kind = classify_body_kind(true, status_code, has_chunked, content_length);
+        assert!(
+            matches!(kind, BodyKind::None),
+            "1xx/204/304 must produce BodyKind::None"
+        );
+    }
+
+    #[kani::proof]
+    fn proof_chunked_requires_te() {
+        let status_code: u16 = kani::any();
+        kani::assume(status_code >= 200 && status_code <= 599);
+        kani::assume(status_code != 204 && status_code != 304);
+        let has_chunked: bool = kani::any();
+        let cl_val: usize = kani::any();
+        kani::assume(cl_val <= 1_000_000);
+        let has_cl: bool = kani::any();
+        let content_length = if has_cl { Some(cl_val) } else { None };
+
+        let kind = classify_body_kind(true, status_code, has_chunked, content_length);
+        if matches!(kind, BodyKind::Chunked) {
+            assert!(
+                has_chunked,
+                "Chunked body kind requires Transfer-Encoding: chunked"
+            );
+        }
+    }
+
+    #[kani::proof]
+    fn proof_content_length_nonneg() {
+        let status_code: u16 = kani::any();
+        kani::assume(status_code >= 200 && status_code <= 599);
+        kani::assume(status_code != 204 && status_code != 304);
+        let cl_val: usize = kani::any();
+        kani::assume(cl_val <= 1_000_000);
+
+        let kind = classify_body_kind(true, status_code, false, Some(cl_val));
+        if let BodyKind::Fixed(n) = kind {
+            assert!(n == cl_val, "Fixed body length must match content-length header");
+        }
     }
 }
 

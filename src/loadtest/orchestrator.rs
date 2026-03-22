@@ -171,15 +171,11 @@ fn read_worker_metrics(
     worker_id: u32,
     stdout: &mut impl Read,
 ) -> Result<RawWorkerMetrics, OrchestratorError> {
-    let metrics_json = read_frame(stdout).map_err(|source| OrchestratorError::WorkerMetricsRead {
-        worker_id,
-        source,
-    })?;
+    let metrics_json = read_frame(stdout)
+        .map_err(|source| OrchestratorError::WorkerMetricsRead { worker_id, source })?;
 
-    serde_json::from_slice(&metrics_json).map_err(|source| OrchestratorError::WorkerMetricsParse {
-        worker_id,
-        source,
-    })
+    serde_json::from_slice(&metrics_json)
+        .map_err(|source| OrchestratorError::WorkerMetricsParse { worker_id, source })
 }
 
 #[cfg(test)]

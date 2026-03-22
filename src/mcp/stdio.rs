@@ -2,7 +2,7 @@
 //!
 //! Handles both trace and loadtest tools over a single stdio JSON-RPC loop.
 
-use crate::loadtest::types::{MergedMetrics, StartLoadTestArgs, TestStatus};
+use crate::loadtest::types::{MergedMetrics, StartLoadTestArgs, TestPhase};
 use crate::mcp::{
     JsonRpcRequest, JsonRpcResponse, McpCapabilities, McpServerInfo, McpTool, PROTOCOL_VERSION,
 };
@@ -37,15 +37,15 @@ pub enum ToolMode {
 pub struct ServerState {
     /// Join handle for the load test thread
     pub join_handle: Mutex<Option<JoinHandle<Result<MergedMetrics, String>>>>,
-    /// Status of current/last test
-    pub status: Mutex<TestStatus>,
+    /// Lifecycle phase of current/last test
+    pub status: Mutex<TestPhase>,
 }
 
 impl ServerState {
     pub fn new() -> Self {
         Self {
             join_handle: Mutex::new(None),
-            status: Mutex::new(TestStatus::default()),
+            status: Mutex::new(TestPhase::default()),
         }
     }
 }
@@ -340,17 +340,14 @@ pub(crate) fn handle_start_load_test(
     // Update status to running (lock ordering: join_handle → status)
     {
         let mut status = state.status.lock().map_err(|e| e.to_string())?;
-        *status = TestStatus {
-            running: true,
-            completed: None,
-            start_time: Some(start_time.clone()),
-            end_time: None,
-            metrics: None,
+        *status = TestPhase::Running {
+            start_time: start_time.clone(),
         };
     }
 
     // Spawn a thread to run the load test
     let state_clone = Arc::clone(state);
+    let start_time_for_thread = start_time.clone();
     let handle = std::thread::spawn(move || {
         let result = crate::bench::run_single_loadtest(&params, true).map_err(|e| e.to_string());
 
@@ -361,12 +358,12 @@ pub(crate) fn handle_start_load_test(
             .unwrap_or_else(|_| "unknown".to_string());
 
         if let Ok(mut status) = state_clone.status.lock() {
-            status.running = false;
-            status.completed = Some(result.is_ok());
-            status.end_time = Some(end_time);
-            if let Ok(ref metrics) = result {
-                status.metrics = Some(metrics.clone());
-            }
+            *status = TestPhase::Finished {
+                start_time: start_time_for_thread,
+                end_time,
+                success: result.is_ok(),
+                metrics: result.as_ref().ok().cloned(),
+            };
         }
 
         result
@@ -392,17 +389,6 @@ pub(crate) fn handle_start_load_test(
 }
 
 pub(crate) fn handle_get_status(state: &Arc<ServerState>) -> Result<String, String> {
-    // Check if the thread has finished and update status accordingly
-    {
-        let handle = state.join_handle.lock().map_err(|e| e.to_string())?;
-        if let Some(ref h) = *handle
-            && h.is_finished()
-        {
-            let mut status = state.status.lock().map_err(|e| e.to_string())?;
-            status.running = false;
-        }
-    }
-
     let status = state.status.lock().map_err(|e| e.to_string())?;
     Ok(serde_json::to_string_pretty(&*status).unwrap())
 }
