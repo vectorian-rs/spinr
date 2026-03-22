@@ -1040,18 +1040,22 @@ impl Connection {
             return Ok(());
         }
 
-        self.state = ConnectionState::Writing;
-        self.write_pos = 0;
-        self.read_len = 0;
-        self.request_start = Some(now);
-        self.measure_request = now >= window.warmup_deadline && now < window.measurement_deadline;
-        self.scheduled_start = match mode {
+        // Capture the due time before leaving Idle; next_due_at() is only
+        // defined for idle connections.
+        let scheduled_start = match mode {
             EngineMode::MaxThroughput => None,
             EngineMode::RateLimited {
                 latency_correction, ..
             } if *latency_correction => self.next_due_at(),
             EngineMode::RateLimited { .. } => None,
         };
+
+        self.state = ConnectionState::Writing;
+        self.write_pos = 0;
+        self.read_len = 0;
+        self.request_start = Some(now);
+        self.measure_request = now >= window.warmup_deadline && now < window.measurement_deadline;
+        self.scheduled_start = scheduled_start;
         self.reregister(poll, Interest::WRITABLE)?;
 
         if request_bytes.is_empty() {
@@ -1198,6 +1202,49 @@ mod tests {
 
         assert_eq!(parsed.status_code, 200);
         assert_eq!(parsed.body_kind, BodyKind::Chunked);
+    }
+
+    #[test]
+    fn rate_limited_runs_record_corrected_latency() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(1) {
+                thread::spawn(move || handle_keep_alive_client(stream));
+            }
+        });
+
+        let request_bytes = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+        let config = EngineConfig {
+            worker_id: 1,
+            remote_addr: addr,
+            method: crate::loadtest::types::HttpMethod::GET,
+            connections: 1,
+            duration_seconds: 0,
+            warmup_seconds: 0,
+            mode: EngineMode::RateLimited {
+                requests_per_second: 20,
+                latency_correction: true,
+            },
+            read_buffer_size: 4096,
+        };
+
+        let metrics = run_for_durations(
+            &config,
+            request_bytes,
+            Duration::ZERO,
+            Duration::from_millis(250),
+        )
+        .unwrap();
+
+        assert!(metrics.request_count > 0, "expected measured requests");
+        let corrected = metrics
+            .latency_corrected
+            .expect("corrected histogram should exist");
+        assert_eq!(corrected.count(), metrics.request_count);
+
+        server.join().unwrap();
     }
 
     #[test]

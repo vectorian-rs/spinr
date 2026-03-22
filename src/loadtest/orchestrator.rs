@@ -15,7 +15,7 @@
 use crate::loadtest::engine::EngineError;
 use crate::loadtest::types::{EngineConfig, RawWorkerMetrics};
 use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
@@ -25,6 +25,20 @@ pub enum OrchestratorError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Engine(#[from] EngineError),
+    #[error("worker {worker_id} exited unsuccessfully: {status}")]
+    WorkerExited { worker_id: u32, status: ExitStatus },
+    #[error("worker {worker_id} metrics read error: {source}")]
+    WorkerMetricsRead {
+        worker_id: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("worker {worker_id} metrics parse error: {source}")]
+    WorkerMetricsParse {
+        worker_id: u32,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Spawn N worker processes, wait for completion, collect metrics.
@@ -64,40 +78,27 @@ pub fn run_workers(
 
     // Wait for all children and collect metrics
     let mut results = Vec::with_capacity(children.len());
+    let mut first_error = None;
     for (worker_id, mut child) in children {
-        let status = child.wait()?;
-        if !status.success() {
-            eprintln!(
-                "[orchestrator] worker {} exited with status: {:?}",
-                worker_id, status
-            );
-            continue;
-        }
-
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-        match read_frame(&mut stdout) {
-            Ok(metrics_json) => match serde_json::from_slice::<RawWorkerMetrics>(&metrics_json) {
-                Ok(metrics) => {
-                    eprintln!(
-                        "[orchestrator] worker {} reported {} requests",
-                        worker_id, metrics.request_count
-                    );
-                    results.push(metrics);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[orchestrator] worker {} metrics parse error: {}",
-                        worker_id, e
-                    );
-                }
-            },
-            Err(e) => {
+        match collect_worker_metrics(worker_id, &mut child) {
+            Ok(metrics) => {
                 eprintln!(
-                    "[orchestrator] worker {} metrics read error: {}",
-                    worker_id, e
+                    "[orchestrator] worker {} reported {} requests",
+                    worker_id, metrics.request_count
                 );
+                results.push(metrics);
+            }
+            Err(err) => {
+                eprintln!("[orchestrator] {}", err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
+    }
+
+    if let Some(err) = first_error {
+        return Err(err);
     }
 
     Ok(results)
@@ -147,9 +148,46 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
+fn collect_worker_metrics(
+    worker_id: u32,
+    child: &mut Child,
+) -> Result<RawWorkerMetrics, OrchestratorError> {
+    let status = child.wait()?;
+    ensure_worker_success(worker_id, status)?;
+
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    read_worker_metrics(worker_id, &mut stdout)
+}
+
+fn ensure_worker_success(worker_id: u32, status: ExitStatus) -> Result<(), OrchestratorError> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OrchestratorError::WorkerExited { worker_id, status })
+    }
+}
+
+fn read_worker_metrics(
+    worker_id: u32,
+    stdout: &mut impl Read,
+) -> Result<RawWorkerMetrics, OrchestratorError> {
+    let metrics_json = read_frame(stdout).map_err(|source| OrchestratorError::WorkerMetricsRead {
+        worker_id,
+        source,
+    })?;
+
+    serde_json::from_slice(&metrics_json).map_err(|source| OrchestratorError::WorkerMetricsParse {
+        worker_id,
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn test_frame_roundtrip() {
@@ -184,6 +222,46 @@ mod tests {
         let result = read_frame(&mut cursor).unwrap();
         assert_eq!(result.len(), 100_000);
         assert!(result.iter().all(|&b| b == 0xAB));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worker_exit_failure_is_error() {
+        let err = ensure_worker_success(7, ExitStatus::from_raw(1 << 8)).unwrap_err();
+        match err {
+            OrchestratorError::WorkerExited { worker_id, status } => {
+                assert_eq!(worker_id, 7);
+                assert!(!status.success());
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_metrics_read_failure_is_error() {
+        let mut cursor = Cursor::new(vec![0u8; 2]);
+        let err = read_worker_metrics(3, &mut cursor).unwrap_err();
+        match err {
+            OrchestratorError::WorkerMetricsRead { worker_id, .. } => {
+                assert_eq!(worker_id, 3);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_metrics_parse_failure_is_error() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, br#"{"not":"raw_worker_metrics"}"#).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let err = read_worker_metrics(5, &mut cursor).unwrap_err();
+        match err {
+            OrchestratorError::WorkerMetricsParse { worker_id, .. } => {
+                assert_eq!(worker_id, 5);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

@@ -280,6 +280,10 @@ pub(crate) fn loadtest_tool_definitions() -> Vec<McpTool> {
                         "type": "integer",
                         "description": "Total requests per second across all workers"
                     },
+                    "connections": {
+                        "type": "integer",
+                        "description": "Number of concurrent connections (default: 1)"
+                    },
                     "threads": {
                         "type": "integer",
                         "description": "Number of worker threads (default: CPU count)"
@@ -325,8 +329,8 @@ pub(crate) fn handle_start_load_test(
     let total_rate = args.total_rate;
     let duration_seconds = args.duration_seconds;
     let threads = args.threads;
-
     let params = args.into_load_test_params()?;
+    let connections = params.connections;
 
     let start_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -378,6 +382,7 @@ pub(crate) fn handle_start_load_test(
             "target_url": target_url,
             "method": method_str,
             "total_rate": total_rate,
+            "connections": connections,
             "threads": threads,
             "duration_seconds": duration_seconds
         }
@@ -522,6 +527,37 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_loadtest_tool_schema_exposes_connections() {
+        let tools = loadtest_tool_definitions();
+        let start_tool = tools
+            .iter()
+            .find(|tool| tool.name == "start_load_test")
+            .unwrap();
+
+        assert_eq!(
+            start_tool.input_schema["properties"]["connections"]["type"],
+            "integer"
+        );
+    }
+
+    #[test]
+    fn test_start_load_test_rejects_zero_connections() {
+        let state = Arc::new(ServerState::new());
+        let result = handle_start_load_test(
+            &state,
+            json!({
+                "target_url": "http://127.0.0.1:8080",
+                "total_rate": 100,
+                "connections": 0,
+                "duration_seconds": 1
+            }),
+        );
+
+        let err = result.unwrap_err();
+        assert!(err.contains("connections must be at least 1"));
     }
 
     #[test]

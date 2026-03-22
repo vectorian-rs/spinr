@@ -97,15 +97,19 @@ impl RawWorkerMetrics {
     }
 
     /// Convert to the public `WorkerMetrics` shape used by output and
-    /// `MergedMetrics::from_workers`.
+    /// `MergedMetrics::from_workers`, preferring corrected latency when it is
+    /// available for rate-limited runs.
     pub fn into_worker_metrics(self) -> WorkerMetrics {
+        let status_codes = self.status_codes_as_map();
+        let latency = self.latency_corrected.unwrap_or(self.latency_uncorrected);
+
         WorkerMetrics {
             worker_id: self.worker_id,
             request_count: self.request_count,
             success_count: self.success_count,
             error_count: self.error_count,
-            status_codes: self.status_codes_as_map(),
-            latency: self.latency_uncorrected,
+            status_codes,
+            latency,
             duration_secs: self.duration_secs,
             payload_bytes: self.payload_bytes,
             wire_bytes: self.wire_bytes,
@@ -233,6 +237,10 @@ pub struct StartLoadTestArgs {
     /// Total requests per second
     pub total_rate: u32,
 
+    /// Number of concurrent connections (default: 1)
+    #[serde(default)]
+    pub connections: Option<u32>,
+
     /// Number of worker threads (default: CPU count)
     #[serde(default)]
     pub threads: Option<u32>,
@@ -248,9 +256,14 @@ impl StartLoadTestArgs {
             Some(m) => m.parse()?,
             None => HttpMethod::GET,
         };
+        let connections = self.connections.unwrap_or(1);
 
         if self.total_rate == 0 {
             return Err("total_rate must be at least 1".to_string());
+        }
+
+        if connections == 0 {
+            return Err("connections must be at least 1".to_string());
         }
 
         if self.duration_seconds == 0 {
@@ -262,7 +275,7 @@ impl StartLoadTestArgs {
             method,
             headers: self.headers.unwrap_or_default(),
             body: self.body,
-            connections: 1,
+            connections,
             duration: self.duration_seconds,
             warmup: 0,
             max_throughput: false,
@@ -391,7 +404,7 @@ pub struct WorkerMetrics {
     /// HTTP status code counts (status_code -> count)
     #[serde(default)]
     pub status_codes: HashMap<u16, u64>,
-    /// Latency histogram (base64-encoded HdrHistogram)
+    /// Latency histogram used for reporting (corrected when available)
     pub latency: HdrLatencyHistogram,
     /// Actual test duration in seconds
     pub duration_secs: f64,
@@ -619,12 +632,14 @@ mod tests {
             )])),
             body: Some(r#"{"test": true}"#.to_string()),
             total_rate: 1000,
+            connections: Some(8),
             threads: Some(4),
             duration_seconds: 30,
         };
 
         let params = args.into_load_test_params().unwrap();
         assert_eq!(params.method, HttpMethod::POST);
+        assert_eq!(params.connections, 8);
         assert_eq!(params.threads, Some(4));
         assert_eq!(params.rate, 1000);
         assert_eq!(params.duration, 30);
@@ -642,12 +657,14 @@ mod tests {
             headers: None,
             body: None,
             total_rate: 100,
+            connections: None,
             threads: None,
             duration_seconds: 10,
         };
 
         let params = args.into_load_test_params().unwrap();
         assert_eq!(params.method, HttpMethod::GET);
+        assert_eq!(params.connections, 1);
         assert_eq!(params.threads, None);
         assert!(params.headers.is_empty());
     }
@@ -660,11 +677,31 @@ mod tests {
             headers: None,
             body: None,
             total_rate: 0,
+            connections: None,
             threads: None,
             duration_seconds: 10,
         };
 
         assert!(args.into_load_test_params().is_err());
+    }
+
+    #[test]
+    fn test_invalid_load_test_connections() {
+        let args = StartLoadTestArgs {
+            target_url: "http://localhost:3000".to_string(),
+            method: None,
+            headers: None,
+            body: None,
+            total_rate: 100,
+            connections: Some(0),
+            threads: None,
+            duration_seconds: 10,
+        };
+
+        match args.into_load_test_params() {
+            Ok(_) => panic!("zero connections should fail"),
+            Err(err) => assert!(err.contains("connections must be at least 1")),
+        }
     }
 
     #[test]
@@ -799,6 +836,38 @@ mod tests {
         assert_eq!(merged.wire_bytes, 5_500);
         assert_eq!(merged.payload_transfer_per_sec, 500.0);
         assert_eq!(merged.wire_transfer_per_sec, 550.0);
+    }
+
+    #[test]
+    fn test_into_worker_metrics_prefers_corrected_latency_when_present() {
+        let mut status_counts = [0u64; 600];
+        status_counts[200] = 2;
+
+        let mut latency_uncorrected = HdrLatencyHistogram::default();
+        latency_uncorrected.record(1_000);
+
+        let mut latency_corrected = HdrLatencyHistogram::default();
+        latency_corrected.record(50_000);
+        latency_corrected.record(60_000);
+
+        let raw = RawWorkerMetrics {
+            worker_id: 3,
+            request_count: 2,
+            success_count: 2,
+            error_count: 0,
+            status_counts,
+            latency_uncorrected,
+            latency_corrected: Some(latency_corrected),
+            duration_secs: 1.0,
+            payload_bytes: 128,
+            wire_bytes: 128,
+        };
+
+        let worker = raw.into_worker_metrics();
+
+        assert_eq!(worker.latency.count(), 2);
+        assert!(worker.latency.min_ms() >= 49.0);
+        assert!(worker.latency.max_ms() >= 59.0);
     }
 
     #[test]
