@@ -1260,14 +1260,14 @@ mod proofs {
     #[kani::proof]
     fn proof_decoder_no_false_done() {
         // "0\r\n\r\n" embedded inside a 5-byte data chunk must not trigger Done
-        let input: [u8; 18] = *b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
-        //                       ^5 bytes of data: "0\r\n\r\n", then terminator
+        // Layout: "5\r\n" (size line) + "0\r\n\r\n" (5 data bytes) + "\r\n" (post-data CRLF) + "0\r\n\r\n" (terminator)
+        let input: [u8; 15] = *b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
 
         let mut dec = ChunkedDecoder::new();
-        // Feed just the data chunk portion
+        // Feed up to end of data + post-data CRLF
         let p1 = dec.feed(&input[..10]); // "5\r\n0\r\n\r\n\r\n"
         assert!(!dec.is_done(), "must not treat embedded 0\\r\\n\\r\\n as terminal");
-        // Feed the real terminator
+        // Feed the real terminator "0\r\n\r\n"
         let p2 = dec.feed(&input[10..]);
         assert!(dec.is_done(), "must finish after real terminator");
         assert!(
