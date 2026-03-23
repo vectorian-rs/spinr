@@ -1,0 +1,8 @@
+[[scenario]]
+name = "text-c32-fixed"
+url = "http://127.0.0.1:3090/text"
+connections = 32
+rate = 10000
+duration = 10
+warmup = 2
+

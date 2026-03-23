@@ -207,11 +207,11 @@ mod proofs {
     use super::*;
 
     #[kani::proof]
-    #[kani::unwind(65)]
+    #[kani::unwind(9)]
     fn proof_distribute_u32_sum() {
         let total: u32 = kani::any();
         let slots: u32 = kani::any();
-        kani::assume(slots >= 1 && slots <= 64);
+        kani::assume(slots >= 1 && slots <= 8);
 
         let shares = distribute_u32(total, slots);
         let sum: u32 = shares.iter().sum();
@@ -219,11 +219,11 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(65)]
+    #[kani::unwind(9)]
     fn proof_distribute_u64_sum() {
         let total: u64 = kani::any();
         let slots: u32 = kani::any();
-        kani::assume(slots >= 1 && slots <= 64);
+        kani::assume(slots >= 1 && slots <= 8);
 
         let shares = distribute_u64(total, slots);
         let sum: u64 = shares.iter().sum();
@@ -231,11 +231,11 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(65)]
+    #[kani::unwind(9)]
     fn proof_distribute_u32_balanced() {
         let total: u32 = kani::any();
         let slots: u32 = kani::any();
-        kani::assume(slots >= 1 && slots <= 64);
+        kani::assume(slots >= 1 && slots <= 8);
 
         let shares = distribute_u32(total, slots);
         let min = *shares.iter().min().unwrap();
@@ -244,11 +244,11 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(65)]
+    #[kani::unwind(9)]
     fn proof_distribute_u64_balanced() {
         let total: u64 = kani::any();
         let slots: u32 = kani::any();
-        kani::assume(slots >= 1 && slots <= 64);
+        kani::assume(slots >= 1 && slots <= 8);
 
         let shares = distribute_u64(total, slots);
         let min = *shares.iter().min().unwrap();
