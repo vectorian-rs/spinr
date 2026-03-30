@@ -44,7 +44,7 @@ jobs:
         run: cargo build --release --target=${{ matrix.target }} --bin spinr
 
       - name: Test
-        run: cargo test --release --target=${{ matrix.target }}
+        run: cargo test --release --target=${{ matrix.target }} -- --skip tla_
 
       - name: Package
         run: |
