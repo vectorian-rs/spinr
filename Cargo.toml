@@ -4,7 +4,7 @@ version = "0.5.1"
 edition = "2024"
 description = "HTTP performance & debugging tool"
 license = "MIT"
-repository = "https://github.com/l1x/spinr"
+repository = "https://github.com/vectorian-rs/spinr"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
